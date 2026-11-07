@@ -5,8 +5,8 @@ This is what you start before going to bed. Each step is retried on failure —
 resume makes that cheap — and between steps the data is checked, so a run does
 not spend six hours converting scenes whose attribution is already broken.
 
-    python tools/run_all.py                    # steps 01 through 08
-    python tools/run_all.py --from 02 --to 04  # a range
+    python tools/run_all.py                    # steps 0A through 10
+    python tools/run_all.py --from 0A --to 10  # full pipeline unattended
     python tools/run_all.py --force            # ignore the gates
 
 The gates:
@@ -145,7 +145,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--from", dest="start", default="0A", help="first step, e.g. 0A or 01")
-    parser.add_argument("--to", dest="end", default="08", help="last step, e.g. 06")
+    parser.add_argument("--to", dest="end", default="10", help="last step, e.g. 08 or 10")
     parser.add_argument("--force", action="store_true", help="run past a failed gate")
     args = parser.parse_args()
 
