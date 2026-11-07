@@ -1,0 +1,31 @@
+# Core dependencies (Steps 0B-09)
+requests>=2.28
+PyYAML>=6.0
+
+# Document Ingestion (Step 0A - Default Docling/PyMuPDF pipeline)
+docling
+pymupdf
+easyocr
+
+# Optional: Alternative High-Quality PDF Extractors (Step 0A Hot-Swaps)
+# Uncomment to install specific backend engines
+# marker-pdf
+# magic-pdf[full]
+# surya-ocr
+
+# Optional: AntiSlop Sampler API (Step 10)
+# Required if running the local AntiSlop server for Step 10
+# fastapi
+# uvicorn
+# ipywidgets
+# IPython
+# transformers
+# bitsandbytes
+# accelerate
+
+# Optional: Parquet diluent support (Step 08)
+# pandas
+# pyarrow
+
+# Optional: Hugging Face Hub publishing (Step 09)
+# huggingface_hub
