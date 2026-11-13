@@ -269,7 +269,7 @@ def run(command, colour):
 def render(cfg, pack, config_path, colour):
     """Draw the whole screen."""
     clear()
-    print(colour("  ROLEPLAY DATASET PIPELINE", "bold"))
+    print(colour("  ROLEPLAY DATASET PIPELINE v5", "bold"))
     print(colour("  prose with dialogue  ->  ShareGPT dataset for a LoRA fine-tune", "dim"))
     print()
 

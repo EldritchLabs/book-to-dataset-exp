@@ -40,17 +40,23 @@ segment:
   # Blocks longer than this go to the LLM for scene boundary detection.
   # Everything else is segmented structurally, for free. Run 00_inspect.py to
   # see how much of your file falls on each side of this line.
-  max_block_chars: 6000
-  min_scene_chars: 600
-  max_scene_chars: 4000
-  llm_window_chars: 4500
+  max_block_chars: 16000
+  min_scene_chars: 200
+  max_scene_chars: 16000
+  llm_window_chars: 6000
   llm_window_overlap: 4
+  # Configurable chapter/section markdown header levels
+  chapter_headers: "#, ##, ###, ####"
   # default
   # max_block_chars: 14000
   # min_scene_chars: 700
   # max_scene_chars: 11000
   # llm_window_chars: 9000
   # llm_window_overlap: 6
+
+attribute:
+  temperature: 0.0
+  colon_dialogue: true
 
 convert:
   base_url: http://localhost:5001
@@ -61,24 +67,36 @@ convert:
   min_turns: 1
   # Scenes with less direct speech than this are skipped. Lower it for a source
   # that is narration-heavy, and expect thinner transcripts.
-  min_dialogue_share: 0.0
-  allow_informational: true
+  min_dialogue_share: 0.0 # allows all scenes to pass through
+  allow_informational: true # prevents discarding of non-dialogue scenes
+  single_speaker_mode: true # prevents discarding of monologue scenes
+  # Source mode: "auto" | "fiction" | "informational"
+  source_mode: auto
   # Anti-data-dump constraint: "on" | "off" | "random"
   # - "on": Enforces strict incremental fact disclosure across turns
   # - "off": Allows character to deliver rich, expansive explanations on Turn 1
   # - "random": Deterministic Bernoulli trial mixing short beats and long explanations
-  anti_dump: random
+  anti_dump: off
   # Cinematic action weaving: "on" | "off" | "random"
   # - "on": Strictly mandates environmental gestures, physical mannerisms, and sensory beats
   # - "off": Focuses on direct, crisp dialogue exchanges without heavy stage directions
   # - "random": Deterministic Bernoulli trial mixing descriptive actions with pure dialogue
-  cinematic_beats: random
-  temperature: 0.3
+  cinematic_beats: on
+  # Minimum char-turn / source-text length ratio before triggering the prose fallback
+  truncation_threshold: 0.65
+  # Deterministically build progressive multi-turn dialogue if the LLM fails, loops, or truncates
+  fallback_on_fail: true
+  temperature: 0.3 # Mistral Nemo default is 0.3
+  # Common nouns, verbs, or locations hallucinated by smaller models to ignore as speakers
+  invalid_speakers:
+    - encampment
 
 validate:
   # Share of the transcript's content words that also occur in the source scene.
   # This is the main defence against the converter writing its own prose.
   lexical_overlap_min: 0.55
+  # Reject Latin-script foreign words ('olhos', 'ojos') and glued words ('visiblyTrembling').
+  foreign_word_check: true
   # The model judge. Set to false to run on the cheap lexical filter alone.
   llm_check: true
   temperature: 0.1
@@ -89,14 +107,21 @@ synth:
   # final dataset is a reasonable target.
   enabled: true
   count: 200
+  turns_min: 3
+  turns_max: 6
   anchors_per_gen: 1
   anchor_max_chars: 5000
   max_anchor_overlap: 0.5
   dedupe_jaccard: 0.35
-  temperature: 1.0
+  temperature: 0.8
   # Leave empty to use the most talkative characters found in step 02, or list
   # names by hand: ["Name One", "Name Two"]
   chars: []
+  # Priority character pool for this lorebook/novel:
+  priority_chars: ["The Chronicler", "Legion Chronicler", "Connacht", "Alric", "Soulblighter", "The Deceiver", "Damas", "Myrdred"]
+  chars_limit: 8
+  # Bernoulli trial probability for cross-entity lore anchor sampling
+  cross_sample_rate: 0.25
 
 format:
   # Leave empty to use the cards from prompts/<lang>.yaml. Override here to
@@ -111,13 +136,18 @@ augment:
   enabled: true
   variants_per_scene: 3
   keep_original: true
+  behavior_drop_rate: 0.33
   min_overlap: 0.55
   min_distinctive: 0.70
+  min_len_ratio: 0.35
   temperature: 0.0
   max_axes_per_variant: 3
   # Optional behavioural directives, see tools/extract_axes.py. Missing file is
   # fine — the step then runs on format axes alone.
   axes_file: axes.yaml
+  holdout_axes: ["html"]
+  pareto_repair: true
+  seed: 420
   output: dataset_aug.jsonl
   # 0 = every transcript. Set to 20 for a trial run before committing the night.
   limit: 0
@@ -144,10 +174,12 @@ assemble:
 antislop:
   enabled: true
   base_url: http://localhost:5001
-  model: unsloth/Llama-3.2-3B-Instruct
-  temperature: 1.0
+  model: MN-12B-Mag-Mell-R1-Uncensored-Scale1.2.i1-IQ4_XS
+  temperature: 0.5
   max_tokens: 4096
-  adjustment_strength: 100.0
+  adjustment_strength: 25.0
+  # Also write chosen/rejected DPO pairs to work/<lang>/dataset_antislop_dpo.jsonl
+  save_dpo_pairs: true
   output: dataset_antislop.jsonl
 
 publish:

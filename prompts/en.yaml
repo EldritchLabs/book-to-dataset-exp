@@ -35,9 +35,7 @@ meta:
     - stranger
     - voice
     - crowd
-    - narrator
     - author
-    - observer
     - first
     - second
     - guest
@@ -77,8 +75,8 @@ meta:
 
   # Used when a name is missing: in scene openers, and when substituting
   # SillyTavern macros in third-party data.
-  fallback_user: the newcomer
-  fallback_char: the character
+  fallback_user: The Inquirer
+  fallback_char: The Chronicler
 
 # System cards written into the dataset. `full` is the standalone card used by
 # step 06. `core` has every formatting instruction removed and is used by step
@@ -129,18 +127,23 @@ attribute:
       "characters": ["names of every character present in the scene"],
       "lines": [{"speaker": "name or 'unknown'", "quote": "first 6-8 words of the line"}]
     }
-    List every line of direct speech, in order. If the speaker cannot be
-    determined unambiguously from the text, write 'unknown' — do not guess.
-    If the text is documentary, expository, or has no spoken dialogue, return:
-    {"characters": [], "lines": []}
+    List every line of direct speech, in order.
+    Note on formatting: In this text, dialogue often appears after an action beat ending in a colon, e.g.:
+      Young Myrdred raises his staff:
+      "Hold the ridge!"
+    In such cases, identify the speaker from the preceding action beat (e.g. "Myrdred").
+    If the text is a first-person journal entry, soldier's chronicle, or monologue, attribute:
+    {"characters": ["The Chronicler"], "lines": []}
 
 # Step 03: scene -> roleplay transcript.
 convert:
   system: >-
-    You convert prose scenes into roleplay transcripts. The key rule: do NOT
-    paraphrase the narration — carry it over nearly verbatim, changing only what
-    the format requires, such as connectives and pronouns. The voice and
-    atmosphere of the source must be fully preserved. Answer with strictly valid
+    You convert prose scenes and military chronicles into roleplay transcripts. The key rule: do NOT
+    paraphrase, summarize, or omit the narration — carry it over nearly verbatim, changing only what
+    the format requires, such as connectives and pronouns. The voice, vocabulary, atmosphere, and full historical
+    account of the source must be completely preserved. If the text is a journal entry or chronicle
+    with a single primary speaker, structure it as an authentic multi-turn briefing where [[user]] asks questions
+    and [[char]] recounts the comprehensive, full-length narrative and vivid chronicle. Answer with strictly valid
     JSON.
 
   user: |-
@@ -153,12 +156,12 @@ convert:
     Line attribution — use it, do not re-attribute: [[attribution]]
 
     Build the transcript:
-    1. char turns = that character's lines plus all the narration around them
-       (actions, setting, inner state), carried over from the text nearly
-       verbatim. Lines of other characters, the ones who are not user, are woven
-       into char turns as narration.
-    2. user turns = that character's lines only, bare, with no narration.
-    3. Preserve the order of events. Add nothing of your own.
+    1. char turns = that character's lines plus the FULL narration from the scene
+       (actions, setting, tactical objectives, reflections), carried over nearly verbatim.
+       Do NOT compress multiple paragraphs into a brief summary line.
+    2. user turns = that character's lines only, bare, with no narration. In solitary chronicles,
+       user provides short prompts to advance the account.
+    3. Preserve the exact sequence of events, canon names, and original wording. Add nothing external.
 
     JSON: {"turns": [{"role": "char"|"user", "text": "..."}]}
 

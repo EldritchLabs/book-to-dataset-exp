@@ -18,8 +18,24 @@ from pipeline.textstats import percentile
 
 # A line made of repeated separator characters: * * *, ---, ~~~ and friends.
 SCENE_BREAK_RE = re.compile(r"^\s*([*#~—\-–_=]\s*){3,}\s*$")
-# A line that opens with a dialogue marker, in any of the common typographies.
+# A line that opens with a dialogue marker, in any of the common typographies,
+# OR a colon-break lead-in line immediately followed by quoted dialogue.
 DIALOGUE_START = re.compile(r'^\s*[—–\-«"„\u201c]')
+COLON_LEAD_IN = re.compile(r':\s*$')
+# Matches markdown headings (# through ####) and bold section titles (**Title**)
+def build_header_regex(cfg):
+    """Build a dynamic header regex from cfg['segment']['chapter_headers']."""
+    headers = cfg.get("segment", {}).get("chapter_headers", ["#", "##", "###", "####"])
+    if isinstance(headers, str):
+        headers = [h.strip() for h in headers.split(",") if h.strip()]
+    
+    # Escape and sort by length descending to match longest prefixes first
+    esc_headers = [re.escape(h) for h in headers if h]
+    if esc_headers:
+        pattern = r"^(?:(?:" + "|".join(esc_headers) + r")\s+(.+)$|\*\*[A-Z0-9].+\*\*\s*$)"
+    else:
+        pattern = r"^(?:#{1,4}\s+(.+)$|\*\*[A-Z0-9].+\*\*\s*$)"
+    return re.compile(pattern, re.M)
 
 
 def main():
@@ -29,6 +45,7 @@ def main():
     # The heading words come from the language pack, so this diagnostic sees
     # exactly what step 01 will see.
     chapter_re = chapter_regex(pack)
+    md_heading_re = build_header_regex(cfg)
 
     source_file = resolve_input_path(cfg)
     text = read_text(source_file, cfg["input"]["encodings"])
@@ -39,13 +56,27 @@ def main():
     lengths = sorted(len(b) for b in blocks)
     lines = text.split("\n")
 
-    dialogue_blocks = [b for b in blocks if DIALOGUE_START.match(b)]
+    def has_dialogue(block):
+        if DIALOGUE_START.match(block):
+            return True
+        b_lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        for i, ln in enumerate(b_lines):
+            if DIALOGUE_START.match(ln):
+                return True
+            if COLON_LEAD_IN.search(ln) and i + 1 < len(b_lines) and DIALOGUE_START.match(b_lines[i + 1]):
+                return True
+        return False
+
+    dialogue_blocks = [b for b in blocks if has_dialogue(b)]
     pure_dialogue = [
         b for b in blocks
         if len(b) > 400
-        and sum(1 for ln in b.split("\n") if DIALOGUE_START.match(ln)) / max(1, len(b.split("\n"))) > 0.8
+        and sum(1 for ln in b.split("\n") if DIALOGUE_START.match(ln.strip())) / max(1, len(b.split("\n"))) > 0.8
     ]
-    chapters = [ln.strip() for ln in lines if chapter_re.match(ln) and len(ln.strip()) < 60]
+    chapters = [
+        ln.strip() for ln in lines 
+        if (chapter_re.match(ln) or md_heading_re.match(ln.strip())) and len(ln.strip()) < 120
+    ]
     breaks = [ln for ln in lines if SCENE_BREAK_RE.match(ln)]
 
     print(f"File: {source_file}, {len(text)} characters")

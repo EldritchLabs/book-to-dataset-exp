@@ -18,6 +18,7 @@ You must have the antislop-sampler running locally in a separate terminal.
     python 10_antislop.py [--config config.yaml]
 """
 import os
+import re
 import sys
 import time
 import requests
@@ -25,10 +26,10 @@ import requests
 from pipeline.config import load_config, parse_args, work_path
 from pipeline.files import append_jsonl, read_jsonl
 
-def regenerate_session(session, cfg):
+def regenerate_session(session, cfg, dpo_out_path=None):
     """Replays a session through the AntiSlop API to regenerate GPT turns."""
     anti_cfg = cfg.get("antislop", {})
-    api_url = anti_cfg.get("base_url", "http://localhost:8000").rstrip("/")
+    api_url = anti_cfg.get("base_url", "http://localhost:5001").rstrip("/")
     model = anti_cfg.get("model", "unsloth/Llama-3.2-3B-Instruct")
     
     messages = []
@@ -45,28 +46,62 @@ def regenerate_session(session, cfg):
             payload = {
                 "model": model,
                 "messages": messages,
-                "temperature": anti_cfg.get("temperature", 1.0),
+                "temperature": anti_cfg.get("temperature", 0.5),
                 "max_tokens": anti_cfg.get("max_tokens", 4096),
-                "adjustment_strength": anti_cfg.get("adjustment_strength", 100.0),
+                "adjustment_strength": anti_cfg.get("adjustment_strength", 25.0),
                 "antislop_enabled": True,
                 "stream": False
             }
             
             # Call the AntiSlop API
+            new_text = None
+            orig_text = msg["value"]
+            
+            # Extract named entities from system card as session whitelist
+            sys_val = next((m["value"] for m in session.get("conversations", []) if m["from"] == "system"), "")
+            session_whitelist = list(set(re.findall(r'\b[A-Z][a-zA-Z’\'-]{2,}\b', sys_val)))
+            if session_whitelist:
+                payload["whitelist"] = session_whitelist[:50]
+
             for attempt in range(3):
                 try:
                     resp = requests.post(f"{api_url}/v1/chat/completions", json=payload, timeout=6000)
                     resp.raise_for_status()
-                    new_text = resp.json()["choices"][0]["message"]["content"]
+                    cand = resp.json()["choices"][0]["message"]["content"].strip()
+                    
+                    # N-Gram Degeneration Check: detect repeating phrase loops
+                    tokens = cand.lower().split()
+                    trigrams = [tuple(tokens[i:i+3]) for i in range(len(tokens)-2)]
+                    repetition_found = False
+                    if trigrams:
+                        from collections import Counter
+                        top_tg = Counter(trigrams).most_common(1)[0]
+                        if top_tg[1] >= 4 and len(tokens) > 30:
+                            repetition_found = True
+
+                    if repetition_found:
+                        print(f"  [warn] AntiSlop repetition loop detected on attempt {attempt+1}, adjusting...", file=sys.stderr)
+                        payload["temperature"] = max(0.5, float(payload["temperature"]) - 0.2)
+                        payload["adjustment_strength"] = max(10.0, float(payload["adjustment_strength"]) * 0.5)
+                        continue
+
+                    new_text = cand
                     break
                 except Exception as e:
-                    print(f"  [warn] AntiSlop API error: {e}. Retrying in 5s...", file=sys.stderr)
-                    time.sleep(5)
-            else:
-                raise RuntimeError("AntiSlop API failed after 3 attempts.")
-            
-            messages.append({"role": "assistant", "content": new_text})
-            new_conversations.append({"from": "gpt", "value": new_text})
+                    print(f"  [warn] AntiSlop API error: {e}. Retrying in 3s...", file=sys.stderr)
+                    time.sleep(3)
+
+            # Fall back safely to original text if API fails or enters repetition loops
+            final_turn = new_text if (new_text and len(new_text) >= 20) else orig_text
+            if dpo_out_path and final_turn != orig_text:
+                prompt_ctx = "\n\n".join(f"{m['role']}: {m['content']}" for m in messages)
+                append_jsonl(dpo_out_path, {
+                    "prompt": prompt_ctx,
+                    "chosen": final_turn,
+                    "rejected": orig_text,
+                })
+            messages.append({"role": "assistant", "content": final_turn})
+            new_conversations.append({"from": "gpt", "value": final_turn})
             
     return {"conversations": new_conversations}
 
@@ -114,14 +149,23 @@ def main():
             gpt_turns = sum(1 for m in session.get("conversations", []) if m.get("from") == "gpt")
             print(f"[{curr_num}/{len(sessions)} {pct:5.1f}% | ETA {eta_str}] Regenerating session {curr_num} ({gpt_turns} turns)...", end=" ", flush=True)
             
-            clean_session = regenerate_session(session, cfg)
+            dpo_path = work_path(cfg, "dataset_antislop_dpo.jsonl") if anti_cfg.get("save_dpo_pairs", False) else None
+            clean_session = regenerate_session(session, cfg, dpo_out_path=dpo_path)
             append_jsonl(out_path, clean_session)
             print("OK", flush=True)
+
+            debug_dir = work_path(cfg, "debug")
+            trace_log = os.path.join(debug_dir, "stage_10_trace.log")
+            with open(trace_log, "a", encoding="utf-8") as tf:
+                tf.write(f"[STAGE 10][PROCESSED] session={curr_num} gpt_turns={gpt_turns}\n")
     except KeyboardInterrupt:
         print("\n[Interrupted] Progress saved. You can resume later.")
         sys.exit(130)
         
-    print(f"\nDone! AntiSlop dataset saved to: {out_path}")
+    total_elapsed = max(0.1, time.time() - start_time)
+    print(f"\nDone! AntiSlop dataset saved to: {out_path} "
+          f"({len(pending)} sessions in {total_elapsed:.1f}s, "
+          f"{len(pending) / (total_elapsed / 60):.1f} sessions/min)")
 
 if __name__ == "__main__":
     main()

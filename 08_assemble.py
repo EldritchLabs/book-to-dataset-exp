@@ -37,6 +37,7 @@ from pipeline.lang import load_pack
 from pipeline.llm import LLM, make_refusal_checker, parallel_map
 from pipeline.safety import filter_sessions
 from pipeline.sharegpt import normalize_entry, trim_session
+from pipeline.textstats import pareto_repair_turn_text
 
 
 def resolve_source_input(cfg):
@@ -215,8 +216,26 @@ def main():
         diluent = translate_sessions(diluent, cfg, pack)
         print(f"  ready: {len(diluent)}")
 
-    final = own + [{"conversations": conversation} for conversation in diluent]
-    rng.shuffle(final)
+    raw_final = own + [{"conversations": conversation} for conversation in diluent]
+    rng.shuffle(raw_final)
+
+    # Final Pareto repair + quote/stalled-word normalization pass across all assembled sessions
+    final = []
+    for entry in raw_final:
+        conv = entry.get("conversations", [])
+        clean_conv = []
+        for msg in conv:
+            val = pareto_repair_turn_text(msg.get("value", ""))
+            if val:
+                n_open, n_close = val.count("\u201c"), val.count("\u201d")
+                if n_open > n_close:
+                    val += "\u201d" * (n_open - n_close)
+                elif n_close > n_open:
+                    val = "\u201c" * (n_close - n_open) + val
+                clean_conv.append({"from": msg["from"], "value": val})
+        if any(m["from"] == "gpt" for m in clean_conv):
+            final.append({"conversations": clean_conv})
+
     output = settings["output"]
     write_jsonl(output, final)
 

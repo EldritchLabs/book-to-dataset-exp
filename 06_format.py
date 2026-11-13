@@ -28,7 +28,7 @@ from pipeline.config import load_config, parse_args, work_path
 from pipeline.files import read_jsonl, require_file, write_jsonl
 from pipeline.lang import load_pack, render
 from pipeline.sharegpt import session_stats, to_sharegpt
-from pipeline.textstats import percentile
+from pipeline.textstats import percentile, pareto_repair_turn_text
 
 
 def load_rows(cfg):
@@ -64,18 +64,34 @@ def main():
     dataset = []
     fallback_char = pack.fallback_char
 
+    debug_dir = work_path(cfg, "debug")
+    os.makedirs(debug_dir, exist_ok=True)
+    trace_log = os.path.join(debug_dir, "stage_06_trace.log")
+
     for row in rows:
         char_name = row.get("char") or fallback_char
         user_name = row.get("user") or fallback_user
         opener = render(openers[row["id"] % len(openers)],
                         char=char_name, user=user_name)
+        # Apply Pareto-optimal cleanups across turns prior to packaging
+        repaired_turns = []
+        for t in row.get("turns", []):
+            clean_txt = pareto_repair_turn_text(t.get("text", ""))
+            if clean_txt:
+                repaired_turns.append({"role": t["role"], "text": clean_txt})
+
         session = to_sharegpt(
-            row["turns"],
+            repaired_turns,
             render(card_template, char=char_name),
             opener=opener,
         )
         if session:
             dataset.append(session)
+            with open(trace_log, "a", encoding="utf-8") as tf:
+                tf.write(f"[STAGE 06][FORMAT] id={row['id']} char={char_name} turns={len(row.get('turns', []))}\n")
+        else:
+            with open(trace_log, "a", encoding="utf-8") as tf:
+                tf.write(f"[STAGE 06][DROP] id={row['id']} char={char_name} reason=invalid_sharegpt_shape\n")
 
     output = cfg["format"]["output"]
     write_jsonl(output, dataset)

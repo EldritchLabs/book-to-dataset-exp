@@ -61,7 +61,7 @@ from pipeline.files import append_jsonl, read_jsonl, require_file, write_jsonl
 from pipeline.lang import load_pack, render
 from pipeline.llm import LLM, extract_json, make_refusal_checker, parallel_map
 from pipeline.sharegpt import normalize_entry, to_sharegpt
-from pipeline.textstats import build_df, overlap, rarity_cutoff, retention
+from pipeline.textstats import build_df, overlap, rarity_cutoff, retention, pareto_repair_turn_text
 
 
 def render_turns(turns):
@@ -85,29 +85,55 @@ def build_system_card(base_card, directives, behavior_pool, behavior_on, char, u
 
 def check_variant(new_turns, old_turns, scene_text, combo, df, cutoff, settings, stem_length,
                   is_refusal):
-    """Return (accepted, reason, retention_score)."""
-    new_text = "\n".join(t["text"] for t in new_turns if t["role"] == "char")
+    """Return (accepted, reason, retention_score, repaired_turns)."""
+    # Heuristically repair candidate turns
+    repaired_turns = []
+    for t in new_turns:
+        repaired_turns.append({
+            "role": t.get("role", "char"),
+            "text": pareto_repair_turn_text(t.get("text", ""))
+        })
+
+    new_text = "\n".join(t["text"] for t in repaired_turns if t["role"] == "char")
     old_text = "\n".join(t["text"] for t in old_turns if t["role"] == "char")
     if not new_text.strip():
-        return False, "empty", 0.0
+        return False, "empty", 0.0, repaired_turns
     if is_refusal(new_text):
-        return False, "refusal", 0.0
+        return False, "refusal", 0.0, repaired_turns
 
     score = retention(old_text, new_text, df, cutoff, stem_length)
+    overlap_score = overlap(new_text, scene_text)
+    ratio = len(new_text) / max(len(old_text), 1)
+    is_additive = any((axis, value) in ADDITIVE for axis, value in combo.items())
+
+    # Pareto multi-objective admissibility check:
+    # If a candidate excels in vocabulary overlap and length fidelity, tolerate slightly softened phrasing
+    use_pareto = settings.get("pareto_repair", True)
+    if use_pareto:
+        admissible = (
+            score >= (settings["min_distinctive"] - 0.08)
+            and (is_additive or overlap_score >= (settings["min_overlap"] - 0.08))
+            and (combo.get("length") == "short" or ratio >= (settings["min_len_ratio"] - 0.05))
+            and (score + (0.5 * overlap_score) >= (settings["min_distinctive"] + 0.5 * settings["min_overlap"] - 0.06))
+        )
+        if not admissible:
+            if score < settings["min_distinctive"] - 0.08:
+                return False, f"softened {score:.2f}", score, repaired_turns
+            if not is_additive and overlap_score < settings["min_overlap"] - 0.08:
+                return False, f"overlap {overlap_score:.2f}", score, repaired_turns
+            if combo.get("length") != "short" and ratio < settings["min_len_ratio"] - 0.05:
+                return False, f"truncated {ratio:.2f}", score, repaired_turns
+        return True, "", score, repaired_turns
+
+    # Standard scalar gate fallback
     if score < settings["min_distinctive"]:
-        return False, f"softened {score:.2f}", score
+        return False, f"softened {score:.2f}", score, repaired_turns
+    if not is_additive and overlap_score < settings["min_overlap"]:
+        return False, f"overlap {overlap_score:.2f}", score, repaired_turns
+    if combo.get("length") != "short" and ratio < settings["min_len_ratio"]:
+        return False, f"truncated {ratio:.2f}", score, repaired_turns
 
-    if not any((axis, value) in ADDITIVE for axis, value in combo.items()):
-        overlap_score = overlap(new_text, scene_text)
-        if overlap_score < settings["min_overlap"]:
-            return False, f"overlap {overlap_score:.2f}", score
-
-    if combo.get("length") != "short":
-        ratio = len(new_text) / max(len(old_text), 1)
-        if ratio < settings["min_len_ratio"]:
-            return False, f"truncated {ratio:.2f}", score
-
-    return True, "", score
+    return True, "", score, repaired_turns
 
 
 def load_behavior_pool(settings):
@@ -321,8 +347,8 @@ def rewrite(cfg):
             print(f"  [{total_done}/{len(jobs)} {pct:4.1f}% | ETA {eta_str}] row {row['id']} variant: ERROR ({error})", flush=True)
         else:
             turns, combo, directives, job_key = result
-            ok, reason, score = check_variant(turns, row["turns"], scene_text, combo,
-                                              df, cutoff, settings, stem_length, is_refusal)
+            ok, reason, score, rep_turns = check_variant(turns, row["turns"], scene_text, combo,
+                                                         df, cutoff, settings, stem_length, is_refusal)
             if not ok:
                 reason_tag = reason.split()[0]
                 rejected[reason_tag] += 1
@@ -332,12 +358,13 @@ def rewrite(cfg):
                 rng = stable_rng(settings["seed"], row["id"], json.dumps(combo, sort_keys=True))
                 behavior_on = rng.random() > settings["behavior_drop_rate"]
                 user_name = row.get("user") or fallback_user
-                card = build_system_card(render(card_template, char=row["char"]),
+                char_name = row.get("char") or pack.fallback_char
+                card = build_system_card(render(card_template, char=char_name),
                                          directives, behavior_pool, behavior_on,
-                                         row["char"], user_name, rng)
+                                         char_name, user_name, rng)
                 opener = render(openers[row["id"] % len(openers)],
-                                char=row["char"], user=user_name)
-                session = to_sharegpt(turns, card, opener=opener)
+                                char=char_name, user=user_name)
+                session = to_sharegpt(rep_turns, card, opener=opener)
                 if session:
                     accepted.append(session)
                     retentions.append(score)
@@ -345,7 +372,6 @@ def rewrite(cfg):
                         stats[f"{axis}={value}"] += 1
                     stats["_behavior_on" if behavior_on else "_behavior_off"] += 1
 
-                    # Atomic save of accepted variant immediately to disk
                     append_jsonl(partial_path, {
                         "_job_key": job_key,
                         "session": session,
@@ -354,6 +380,11 @@ def rewrite(cfg):
                         "behavior_on": behavior_on
                     })
                     print(f"  [{total_done}/{len(jobs)} {pct:4.1f}% | ETA {eta_str}] row {row['id']} variant: OK (retention {score:.2f})", flush=True)
+                    
+                    debug_dir = work_path(cfg, "debug")
+                    trace_log = os.path.join(debug_dir, "stage_07_trace.log")
+                    with open(trace_log, "a", encoding="utf-8") as tf:
+                        tf.write(f"[STAGE 07][ACCEPT] row={row['id']} retention={score:.2f} combo={list(combo.keys())}\n")
 
     # Assemble final output dataset from accepted variants
     final_sessions = list(accepted)

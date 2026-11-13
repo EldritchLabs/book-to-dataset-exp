@@ -106,3 +106,36 @@ def percentile(sorted_values, share):
         return 0
     index = min(len(sorted_values) - 1, int(len(sorted_values) * share))
     return sorted_values[index]
+
+
+def is_pareto_efficient(candidates):
+    """Return boolean mask for candidates on the Pareto frontier.
+    
+    candidates: list of tuples where all objectives are maximized.
+    """
+    import numpy as np
+    pts = np.array(candidates)
+    is_efficient = np.ones(pts.shape[0], dtype=bool)
+    for i, c in enumerate(pts):
+        if is_efficient[i]:
+            is_efficient[is_efficient] = np.any(pts[is_efficient] >= c, axis=1)
+            is_efficient[i] = True
+    return is_efficient
+
+
+def pareto_repair_turn_text(text: str) -> str:
+    """Non-destructive heuristic repairs for near-frontier candidate texts."""
+    if not text:
+        return ""
+    t = text.strip()
+    # Strip conversational LLM framing preambles
+    t = re.sub(r'^(?:Here is (?:the|a) (?:converted|reformatted|roleplay) (?:transcript|turn|response):?\s*)', '', t, flags=re.I).strip()
+    # Remove dangling unclosed markdown quotes or broken turn tags
+    t = re.sub(r'\s*\[(?:user|char)\]\s*$', '', t, flags=re.I).strip()
+    # Restore unclosed boundary quotation
+    if t.count('"') % 2 == 1:
+        t += '"'
+    # Ensure proper terminal punctuation
+    if t and t[-1] not in ('.', '!', '?', '"', '*', "'", '»', '”'):
+        t += '.'
+    return t

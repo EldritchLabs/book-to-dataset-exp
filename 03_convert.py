@@ -32,6 +32,57 @@ from pipeline.lang import load_pack, render
 from pipeline.llm import LLM, extract_json, make_refusal_checker, parallel_map
 
 
+_REPEAT_EXEMPT_WORDS = frozenset(
+    "a an the and but or if so then than that this these those it its "
+    "i you he she we they me my your his her our their "
+    "is was are were be been am do does did done have has had "
+    "not no nor yes yeah yep nah nope to of in on at for with from by as "
+    "very really quite too also still even just only much many "
+    "all some any every each oh ah ahh ohh ha haha heh hey hi hello bye "
+    "hmm mm uh um er erm well now right okay ok sure fine good bad better best "
+    "wow yay please wait stop more again go come back what why how when where who which".split()
+)
+_REPEATED_SENT_RE = re.compile(r"\b([A-Za-z][A-Za-z'-]*)([.!?])(?:\s+\1\2)+", re.I)
+_REPEATED_COMMA_END_RE = re.compile(r"\b([A-Za-z][A-Za-z'-]*)(?:[,;]\s*\1\b)+\s*([.!?])", re.I)
+_REPEATED_COMMA_RE = re.compile(r"\b([A-Za-z][A-Za-z'-]*)(?:[,;]\s*\1\b)+", re.I)
+_REPEATED_BARE_RE = re.compile(r"\b([A-Za-z][A-Za-z'-]*)(?:\s+\1\b)+", re.I)
+
+
+def collapse_repeated_words(text):
+    """Collapse stalled word repetitions ('Word. Word.' -> 'Word.') while sparing emphasis."""
+    if not text:
+        return text
+
+    def _keep_punct(m):
+        w, p = m.group(1), m.group(2)
+        return m.group(0) if w.lower() in _REPEAT_EXEMPT_WORDS else w + p
+
+    def _keep_word(m):
+        w = m.group(1)
+        return m.group(0) if w.lower() in _REPEAT_EXEMPT_WORDS else w
+
+    text = _REPEATED_SENT_RE.sub(_keep_punct, text)
+    text = _REPEATED_COMMA_END_RE.sub(_keep_punct, text)
+    text = _REPEATED_COMMA_RE.sub(_keep_word, text)
+    text = _REPEATED_BARE_RE.sub(_keep_word, text)
+    return text
+
+
+def normalize_quotes(text):
+    """Collapse doubled quotes and balance curly double quotes."""
+    if not text:
+        return text
+    text = re.sub(r'"{2,}', '"', text)
+    text = re.sub(r"\u201c{2,}", "\u201c", text)
+    text = re.sub(r"\u201d{2,}", "\u201d", text)
+    n_open, n_close = text.count("\u201c"), text.count("\u201d")
+    if n_open > n_close:
+        text += "\u201d" * (n_open - n_close)
+    elif n_close > n_open:
+        text = "\u201c" * (n_close - n_open) + text
+    return text
+
+
 def clean_scene_text(text):
     """Strip image embeds, OCR noise artifacts, and collapse excessive spacing."""
     if not text:
@@ -124,37 +175,84 @@ def repair_and_filter_scenes(cfg, debug_dir):
     return out_path
 
 
-def pick_pair(scene, forced_char, unknown, generic):
-    """Choose (char, user) for a scene, or (None, None) if it is unusable.
+def chunk_prose_to_progressive_turns(text, chapter_name="", user_probes=None):
+    """Deterministically transform raw prose into a high-density, multi-turn dialogue."""
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if not paragraphs:
+        paragraphs = [text.strip()]
 
-    A speaker is only a candidate if it is a real name: not the unknown marker,
-    not a pronoun or a role word, and longer than one character. Those come back
-    from attribution regularly, and a transcript whose char is "the voice"
-    teaches nothing.
-    """
+    turns = []
+    title_ref = f" regarding {chapter_name}" if chapter_name else ""
+    turns.append({
+        "role": "user",
+        "text": f"*Looks over{title_ref}.* Go on—tell me what happened."
+    })
+
+    default_probes = [
+        "What happened next?",
+        "Go on. Tell me the rest.",
+        "And how did things unfold from there?",
+        "What did you make of that?",
+        "And then what?",
+        "How did it end?",
+        "*Listens closely as the account unfolds, leaning forward.* What occurred next?",
+        "Gestures toward the map.* And how did the lines hold against that onslaught?",
+        "*Eyes narrowing in astonishment.* How did the command respond to such odds?",
+        "*Nods solemnly.* And what was the outcome of that clash?",
+        "*A tense silence falls between them.* What fate befell those who stood their ground?",
+        "*Inquires softly.* And what remained when the smoke finally cleared?"
+    ]
+    probes = user_probes if user_probes else default_probes
+
+    for idx, para in enumerate(paragraphs):
+        clean_para = para.strip()
+        if not clean_para:
+            continue
+        turns.append({"role": "char", "text": clean_para})
+        if idx < len(paragraphs) - 1:
+            turns.append({"role": "user", "text": probes[idx % len(probes)]})
+
+    return turns
+
+
+def pick_pair(scene, forced_char, unknown, generic, invalid_set=None, fallback_char="The Chronicler", fallback_user="The Inquirer"):
+    """Choose (char, user) for a scene, ensuring single-speaker journals are retained."""
     speakers = []
+    invalid_set = invalid_set or set() # Words that are common nouns, verbs, or locations hallucinated as speaker names
+    
+    def _is_valid_name(n):
+        s = str(n).strip()
+        if not s or len(s) <= 1:
+            return False
+        low = s.lower()
+        if low == unknown or low in invalid_set:
+            return False
+        if low in generic and low not in ("narrator", "chronicler"):
+            return False
+        return True
+
     for line in scene.get("lines", []):
         name = str(line.get("speaker", "")).strip()
-        if not name or len(name) <= 1:
-            continue
-        if name.lower() == unknown or name.lower() in generic:
-            continue
-        speakers.append(name)
+        if _is_valid_name(name):
+            speakers.append(name)
+
+    # If no lines were attributed, check scene characters
+    if not speakers and scene.get("characters"):
+        speakers = [c for c in scene["characters"] if _is_valid_name(c)]
+
+    # Single-speaker or solo-journal fallback
     if not speakers:
-        return None, None
+        return fallback_char, fallback_user
 
     counts = Counter(speakers)
     if forced_char and forced_char.lower() != "auto":
-        if forced_char not in counts:
-            return None, None
         char = forced_char
     else:
         char = counts.most_common(1)[0][0]
 
     others = [name for name, _ in counts.most_common() if name != char]
-    if not others:
-        return None, None
-    return char, others[0]  # user = the second most active speaker
+    user = others[0] if others else fallback_user
+    return char, user
 
 
 def main():
@@ -185,23 +283,40 @@ def main():
 
     pending, skipped = [], 0
     allow_informational = cfg.get("convert", {}).get("allow_informational", True)
-    default_speaker = pack.get("meta.fallback_char", "Narrator")
-    default_listener = pack.get("meta.fallback_user", "Inquirer")
+    default_speaker = pack.get("meta.fallback_char", "The Chronicler")
+    default_listener = pack.get("meta.fallback_user", "The Inquirer")
+
+    # Combine config invalid_speakers into a set for filtering
+    raw_invalid = convert.get("invalid_speakers", [])
+    if isinstance(raw_invalid, str):
+        raw_invalid = [w.strip() for w in raw_invalid.split(",") if w.strip()]
+    invalid_set = {str(w).strip().lower() for w in raw_invalid if w}
+
+    source_mode = str(convert.get("source_mode", "auto")).strip().lower()
 
     for scene in scenes:
         if scene["id"] in done:
             continue
-        char, user = pick_pair(scene, convert.get("char", "auto"), unknown, generic)
-        if not char or scene.get("dialogue_share", 0) < convert["min_dialogue_share"]:
-            if allow_informational and len(scene.get("text", "")) >= 300:
-                # Informational / non-dialogue scene: convert into a teacher/student exchange
-                char, user = default_speaker, default_listener
+        char, user = pick_pair(
+            scene, convert.get("char", "auto"), unknown, generic,
+            invalid_set=invalid_set,
+            fallback_char=default_speaker, fallback_user=default_listener
+        )
+        
+        if source_mode == "informational":
+            scene["_is_informational"] = True
+        elif source_mode == "fiction":
+            scene["_is_informational"] = False
+        else:
+            # Auto-detect: informational if no secondary speaker or very low dialogue
+            if not char or user == default_listener or len(scene.get("lines", [])) <= 2:
                 scene["_is_informational"] = True
             else:
-                skipped += 1
-                continue
-        else:
-            scene["_is_informational"] = False
+                scene["_is_informational"] = False
+
+        # In v5, single-speaker logs and lore entries are never discarded
+        if not char:
+            char, user = default_speaker, default_listener
 
         scene["_char"], scene["_user"] = char, user
         pending.append(scene)
@@ -282,11 +397,21 @@ def main():
         attribution = "; ".join(
             f"\"{line.get('quote', '')}...\" — {line.get('speaker', '')}"
             for line in scene.get("lines", []))
+        user_prompt = render(
+            pack.require("convert.user"),
+            scene=scene["text"], char=scene["_char"],
+            user=scene["_user"], attribution=attribution
+        )
+        # For long prose chapters, append explicit instruction against truncation
+        if len(scene.get("text", "")) > 1500:
+            user_prompt += (
+                f"\n\nCRITICAL: Do NOT summarize or truncate. Carry over the full narration, atmospheric descriptions, "
+                f"and events from the scene into the dialogue turns."
+            )
+
         return llm.chat(
             pack.require("convert.system"),
-            render(pack.require("convert.user"),
-                   scene=scene["text"], char=scene["_char"],
-                   user=scene["_user"], attribution=attribution),
+            user_prompt,
             temperature=convert["temperature"],
             json_mode=True,
         )
@@ -352,36 +477,105 @@ def main():
                 fail_file = os.path.join(debug_dir, f"convert_fail_{scene['id']}.txt")
                 with open(fail_file, "w", encoding="utf-8") as f:
                     f.write(f"--- ERROR: {exc} ---\n\n" + (raw or ""))
-                print(f"  [warn] scene {scene['id']}: invalid JSON (logged to {fail_file})",
+                print(f"  [warn] scene {scene['id']}: invalid JSON (logged to {fail_file}); triggering fallback builder",
                       file=sys.stderr)
-                continue
 
         raw_turns = []
         if isinstance(data, list):
-            raw_turns = data
+            # If model returned [{"turns": [...]}] or [{"turns": [...]}, {"turns": []}]
+            if data and isinstance(data[0], dict) and "turns" in data[0]:
+                for item in data:
+                    if isinstance(item, dict) and isinstance(item.get("turns"), list):
+                        raw_turns.extend(item["turns"])
+            else:
+                raw_turns = data
         elif isinstance(data, dict):
             raw_turns = data.get("turns", [])
 
-        turns = [
-            turn for turn in raw_turns
-            if isinstance(turn, dict)
-            and turn.get("role") in ("char", "user")
-            and str(turn.get("text", "")).strip()
-        ]
+        # Filter out trailing hallucinated integer/token loops like [1], [2], [3]...
+        clean_raw = []
+        for t in raw_turns:
+            if isinstance(t, (int, float)):
+                continue
+            if isinstance(t, list) and len(t) == 1 and isinstance(t[0], (int, float)):
+                continue
+            clean_raw.append(t)
+        raw_turns = clean_raw
 
-        if len(turns) < convert["min_turns"] or not any(t["role"] == "char" for t in turns):
-            fail_file = os.path.join(debug_dir, f"convert_dropped_{scene['id']}.txt")
-            with open(fail_file, "w", encoding="utf-8") as f:
-                f.write(f"--- REASON: Insufficient turns ({len(turns)} < {convert['min_turns']}) ---\n\n" + (raw or ""))
-            skipped += 1
-            continue
+        turns = []
+        for i, turn in enumerate(raw_turns):
+            if isinstance(turn, dict):
+                # Pattern A: Standard {"role": "char", "text": "..."}
+                role = turn.get("role")
+                text_val = str(turn.get("text") or turn.get("turn") or "").strip()
+                
+                # Pattern B: {"char": "text"} or {"user": "text"}
+                if not text_val:
+                    if "char" in turn and str(turn["char"]).strip():
+                        role = "char"
+                        text_val = str(turn["char"]).strip()
+                    elif "user" in turn and str(turn["user"]).strip():
+                        role = "user"
+                        text_val = str(turn["user"]).strip()
+                    else:
+                        # Pattern C: Dict keys as dialogue statements (e.g. convert_dropped_49)
+                        for k, v in turn.items():
+                            k_str, v_str = str(k).strip(), str(v).strip()
+                            if len(k_str) > 20 and not k_str.startswith("{"):
+                                turns.append({"role": "char", "text": k_str})
+                            if len(v_str) > 20 and v is not None and str(v).lower() != "none":
+                                turns.append({"role": "user", "text": v_str})
+                        continue
+
+                if not text_val:
+                    continue
+                if role not in ("char", "user"):
+                    role = "char" if i % 2 == 0 else "user"
+                text_val = normalize_quotes(collapse_repeated_words(text_val))
+                turns.append({"role": role, "text": text_val})
+            elif isinstance(turn, str) and turn.strip():
+                role = "user" if i % 2 == 0 else "char"
+                turns.append({"role": role, "text": turn.strip()})
+
+        # Ensure conversation starts with user if it's an informational dialogue
+        if turns and turns[0]["role"] == "char" and len(turns) == 1:
+            ch_name = scene.get("chapter", "the campaign")
+            opener = f"*Inquires about the events recorded in {ch_name}. What transpired on the field?*"
+            turns.insert(0, {"role": "user", "text": opener})
+
+        # High-Fidelity Guarantee:
+        # If model returned no character turns, heavily truncated (< 65% of source), or looped,
+        # build a complete multi-turn dialogue directly from the source prose.
+        char_text = " ".join(t["text"] for t in turns if t.get("role") == "char")
+        source_text = clean_scene_text(scene.get("text", ""))
+
+        has_repetition_loop = False
+        if len(turns) > 8:
+            turn_texts = [t["text"][:60] for t in turns]
+            if len(turn_texts) - len(set(turn_texts)) > 3:
+                has_repetition_loop = True
+
+        trunc_thresh = float(convert.get("truncation_threshold", 0.65))
+        is_truncated = len(source_text) > 600 and (len(char_text) < len(source_text) * trunc_thresh)
+
+        used_fallback = False
+        if not any(t["role"] == "char" for t in turns) or has_repetition_loop or is_truncated:
+            if convert.get("fallback_on_fail", True):
+                ch_name = scene.get("chapter") or ""
+                turns = chunk_prose_to_progressive_turns(source_text, chapter_name=ch_name)
+                used_fallback = True
+            elif not any(t["role"] == "char" for t in turns):
+                print(f"scene {scene['id']}: skipped (no char turns, fallback_on_fail is false)")
+                skipped += 1
+                continue
 
         append_jsonl(out_path, {"id": next_id, "source_id": scene["id"],
                                 "char": scene["_char"], "user": scene["_user"],
                                 "turns": turns})
+        mode_tag = " [fallback]" if used_fallback else ""
+        print(f"scene {scene['id']} -> rp {next_id}: {len(turns)} turns "
+              f"({scene['_char']} / {scene['_user']}){mode_tag}")
         next_id += 1
-        print(f"scene {scene['id']} -> {len(turns)} turns "
-              f"({scene['_char']} / {scene['_user']})")
 
     print(f"\nDone: {next_id} transcripts, {skipped} skipped -> {out_path}")
     if n_refusals:

@@ -259,6 +259,7 @@ STEPS = [
 EXTRAS = [
     ("A", None, "Run steps 0A-10 unattended"),
     ("S", "tools/status.py", "Detailed progress report"),
+    ("M", "tools/metrics_watch.py", "Live AntiSlop metrics"),
     ("V", None, "Read some finished sessions"),
     ("I", "tools/import_transcripts.py", "Import an already-dialogue archive"),
     ("T", None, "Offline smoke test, no GPU"),
@@ -339,7 +340,7 @@ def render(cfg, pack, config_path, colour):
 
     # 1. Header Card
     print(colour("┌" + "─" * W + "┐", "cyan"))
-    print(box_line("  BOOK-TO-DATASET PIPELINE (v4 EXPERIMENTAL)"))
+    print(box_line("  BOOK-TO-DATASET PIPELINE (v5 EXPERIMENTAL)"))
     print(box_line(colour("  prose & non-fiction  -->  ShareGPT SFT dataset for LoRA", "dim")))
     print(colour("├" + "─" * W + "┤", "cyan"))
 

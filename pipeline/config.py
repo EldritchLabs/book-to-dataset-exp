@@ -53,22 +53,25 @@ DEFAULTS = {
     "segment": {
         # A structural block longer than this is handed to the LLM for scene
         # boundary detection. Shorter blocks are kept as they are, for free.
-        "max_block_chars": 5000,
+        "max_block_chars": 12000,
         # Scenes shorter than this are glued to their neighbour.
-        "min_scene_chars": 600,
+        "min_scene_chars": 200,
         # Scenes longer than this are split on paragraph borders.
-        "max_scene_chars": 4000,
+        "max_scene_chars": 12000,
         # Sliding window budget for the LLM pass, in characters.
-        "llm_window_chars": 4500,
+        "llm_window_chars": 6000,
         # Window overlap, in paragraphs, so a boundary at a window edge is not lost.
         "llm_window_overlap": 4,
+        # Configurable markdown header levels to treat as chapter boundaries
+        "chapter_headers": ["#", "##", "###", "####"],
     },
 
     "attribute": {
         "temperature": 0.0,
+        "colon_dialogue": True,
     },
 
-     "convert": {
+    "convert": {
         # Who becomes {{char}}: "auto" = the most talkative speaker of the scene,
         # or an exact character name to keep only scenes where that name speaks.
         "char": "auto",
@@ -78,11 +81,17 @@ DEFAULTS = {
         "min_dialogue_share": 0.0,
         # Non-fiction / expository roleplay conversion fallback
         "allow_informational": True,
+        # Support single-speaker monologues and journals
+        "single_speaker_mode": True,
+        # Source mode: "auto" (detect per scene), "fiction" (narrative RP), or "informational" (factual briefing)
+        "source_mode": "auto",
         # Anti-data-dump constraint: "on" | "off" | "random"
-        "anti_dump": "random",
+        "anti_dump": "off",
         # Cinematic action weaving: "on" | "off" | "random"
-        "cinematic_beats": "random",
+        "cinematic_beats": "on",
         "temperature": 0.3,
+        # Configurable list of words/nouns to never treat as speaker names
+        "invalid_speakers": [],
     },
 
     "validate": {
@@ -103,8 +112,8 @@ DEFAULTS = {
         "turns_min": 3,
         "turns_max": 6,
         # Real scenes shown to the model per generation, as thinking anchors.
-        "anchors_per_gen": 2,
-        "anchor_max_chars": 2500,
+        "anchors_per_gen": 1,
+        "anchor_max_chars": 3500,
         # Above this overlap with the anchors the model is rewriting the source.
         "max_anchor_overlap": 0.5,
         # 4-gram Jaccard against already accepted rows.
@@ -113,7 +122,11 @@ DEFAULTS = {
         # Explicit character rotation. Empty = the most talkative characters found
         # in step 02.
         "chars": [],
+        # Configurable priority entity pool for lorebooks & novels (generic, non-hardcoded)
+        "priority_chars": [],
         "chars_limit": 8,
+        # Bernoulli trial probability for cross-entity lore anchor sampling
+        "cross_sample_rate": 0.25,
     },
 
     "format": {
@@ -149,9 +162,11 @@ DEFAULTS = {
         # generalisation to unseen instructions can be measured.
         "holdout_axes": ["html"],
         "output": "dataset_aug.jsonl",
-        "seed": 42,
+        "seed": 420,
         # 0 = every transcript. N = a random sample of N, for a trial run.
         "limit": 0,
+        # Enable multi-objective Pareto frontier scoring and heuristic repair
+        "pareto_repair": True,
     },
 
     "assemble": {
@@ -183,9 +198,9 @@ DEFAULTS = {
         "enabled": False,
         "base_url": "http://localhost:8000",
         "model": "unsloth/Llama-3.2-3B-Instruct",
-        "temperature": 1.0,
+        "temperature": 0.5, # adjust as needed per model
         "max_tokens": 4096,
-        "adjustment_strength": 100.0,
+        "adjustment_strength": 25.0,
         "output": "dataset_antislop.jsonl",
     },
 

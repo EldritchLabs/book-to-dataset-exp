@@ -157,7 +157,14 @@ def main():
     selected = STEPS[numbers.index(args.start):numbers.index(args.end) + 1]
     print(f"Running: {', '.join(n for n, _p, _l in selected)}   config: {args.config}")
 
+    source_exists = os.path.exists("input/source.md") or os.path.exists("input/source.txt")
+
     for number, path, label in selected:
+        # If source text is already prepared, skip Step 0A cleanly
+        if number == "0A" and source_exists:
+            print(f"\n===== step 0A (pdf_prep): source text already exists — skipping =====", flush=True)
+            continue
+
         if not run_step(f"step {number} ({label})", path, args.config):
             sys.exit(1)
 

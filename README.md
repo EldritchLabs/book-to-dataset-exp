@@ -1,6 +1,27 @@
-# book-to-dataset-exp v4
+# book-to-dataset-exp v5
 
 *A high-yield synthetic dataset pipeline adapted for both prose fiction and complex non-fiction literature, using LLMs to generate ShareGPT SFT datasets from books you provide, with optional Anti-Slop integration from Sam Paech.*
+
+## What's New in v5 (Zero-Loss & Anti-Collapse Release)
+
+v5 upgrades the pipeline from a strict fiction-only extractor into a **zero-loss, domain-agnostic engine** that handles novels, lorebooks, and expository monographs alike, incorporating hardened text-hygiene and anti-collapse mechanics:
+
+- **Zero-Loss Segmentation & Attribution (`01_segment.py`, `02_attribute.py`)**:
+  - Configurable `segment.chapter_headers` and tuple-aware `merge_short` / `cap_long` preserve exact chapter metadata without cross-chapter shredding.
+  - Supports colon-break dialogue (`Action:\n"Quote"`) and single-speaker/monologue entries (`The Chronicler` / `The Inquirer`), with configurable `convert.invalid_speakers`.
+- **Adaptive Conversion & Deterministic Fallback (`03_convert.py`)**:
+  - `convert.source_mode` (`auto` | `fiction` | `informational`), `anti_dump`, and `cinematic_beats` tune pacing and action weaving per scene.
+  - `fallback_on_fail` + `truncation_threshold` deterministically reconstruct progressive multi-turn dialogue if the LLM loops, truncates, or fails JSON.
+  - Deterministic cleanup (`collapse_repeated_words`, `normalize_quotes`) repairs stalled word repetitions and unbalanced curly quotes.
+- **Hardened Validation & JSON Repair Ladder (`04_validate.py`, `pipeline/llm.py`)**:
+  - Multi-rung `extract_json()` (`raw_decode` scanning, lenient normalization, truncated-JSON closing) plus a format-repair retry round for the LLM judge.
+  - Zero-cost Pass 1 gates catch unquoted AI-assistant OOC drift (`has_ooc_narration`) and Latin-script foreign/glued words (`foreign_word_check`).
+- **Anti-Collapse Synthesis & Pareto Augmentation (`05_synthesize.py`, `07_augment.py`)**:
+  - Deck-dealing without replacement for `situations` and `behavior_mods`, plus first-reply opener caps to prevent opening-phrase collapse.
+  - Bernoulli cross-sampling (`cross_sample_rate`) and Pareto-optimal frontier scoring (`pareto_repair`).
+- **AntiSlop DPO Export & Live Telemetry (`10_antislop.py`, `tools/metrics_watch.py`, `menu.py`)**:
+  - Optional `antislop.save_dpo_pairs` exports `chosen`/`rejected` DPO pairs alongside the de-slopped SFT dataset.
+  - Added `[M]` in `menu.py` (`tools/metrics_watch.py`) for live vLLM / AntiSlop `/metrics` monitoring (tok/s, KV-cache %, ban & backtrack rates).
 
 ---
 
@@ -8,7 +29,8 @@
 
 * **Upstream Foundation (v1):** Originally designed and authored by **SubMaroon** with assistance from **Anthropic Claude**. Built to produce the training corpus for the [Boulesis-v2.1-26B-A4B](https://huggingface.co/SubMaroon/Boulesis-v2.1-26B-A4B) model family.
 * **Experimental Architecture & Refactor (v4):** Expanded, hardened, and adapted by **EldritchLabs** with assistance from **Google Gemini**. Transforms a fiction-centric extraction pipeline into a crash-resilient framework capable of processing non-fiction, historical monographs, investigative exposés, and technical works without discarding information or collapsing into dry Q&A pairs.
-* **Anti-Slop:** Regenerate GPT turns via AntiSlop API. Original code by **Sam Paech**.
+* **Anti-Slop (v4):** Regenerate GPT turns via AntiSlop API. [Original code](https://github.com/sam-paech/antislop-sampler) by **Sam Paech**.
+* **ReadyArt’s Synthetic Dataset Generator** (v5): [Original code](https://github.com/Ready-Art/Synthetic-Dataset-Generator) by **ReadyArt**.
 
 ---
 

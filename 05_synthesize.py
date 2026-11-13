@@ -101,17 +101,35 @@ def synthesize_missing_turn(llm, turns, char, situation, anchor_text):
     return turns
 
 
-def top_characters(scenes, unknown, generic, limit, min_lines=5):
-    """Characters worth rotating through: real names with enough lines."""
+def top_characters(scenes, unknown, generic, limit, priority_pool=None, min_lines=2):
+    """Characters worth rotating through: extracts distinct entities across all chapters."""
     counts = Counter()
     for scene in scenes:
         for line in scene.get("lines", []):
             name = str(line.get("speaker", "")).strip()
-            if len(name) <= 1 or name.lower() == unknown or name.lower() in generic:
+            if len(name) <= 1 or name.lower() == unknown:
+                continue
+            if name.lower() in generic and name.lower() not in ("narrator", "chronicler"):
                 continue
             counts[name] += 1
-    return [name for name, count in counts.most_common(limit * 2)
-            if count >= min_lines][:limit]
+        for ch in scene.get("characters", []):
+            if len(ch) > 1 and ch.lower() != unknown:
+                counts[ch] += 1
+
+    # Guarantee canonical protagonists and antagonists are available if defined in config
+    priority_pool = priority_pool or []
+    selected = []
+    # Match priority names case-insensitively against identified speakers
+    for p_name in priority_pool:
+        for found_name in counts:
+            if p_name.lower() == found_name.lower() or p_name.lower() in found_name.lower():
+                if found_name not in selected:
+                    selected.append(found_name)
+
+    for name, _ in counts.most_common():
+        if name not in selected and len(selected) < limit:
+            selected.append(name)
+    return selected if selected else [name for name, _ in counts.most_common(limit)]
 
 
 def main():
@@ -132,9 +150,28 @@ def main():
     behavior_mods = pack.get("synth.behavior_mods", [""])
     assert situations, "the language pack has an empty synth.situations list"
 
+    # Blueprint C: Deck-dealing without replacement for situations & behavior_mods
+    _sit_deck = []
+    _mod_deck = []
+
+    def _deal_from(pool, deck, rng):
+        if not pool:
+            return ""
+        if not deck:
+            deck.extend(pool)
+            rng.shuffle(deck)
+        return deck.pop()
+
+    # Blueprint C: First-reply opener caps (prevents opening-phrase collapse)
+    _first_word_counts = Counter()
+    _opener_frame_counts = Counter()
+    _first_reply_total = 0
+
     scenes = read_jsonl(require_file(work_path(cfg, "scenes_attr.jsonl"), "02_attribute.py"))
+    priority_chars = synth.get("priority_chars", [])
     characters = synth.get("chars") or top_characters(
-        scenes, pack.unknown_speaker.lower(), pack.generic_speakers, synth["chars_limit"])
+        scenes, pack.unknown_speaker.lower(), pack.generic_speakers, synth["chars_limit"],
+        priority_pool=priority_chars)
 
     if not characters:
         # Fallback 1: Collect any named entities in scene['characters']
@@ -177,15 +214,35 @@ def main():
     if done:
         print(f"[resume] {len(done)} rows already processed, continuing")
 
+    cross_sample_rate = float(synth.get("cross_sample_rate", 0.25))
+
     def ingredients(row_id):
-        """Everything one row is built from, decided by its id alone."""
+        """Everything one row is built from, with Bernoulli cross-sampling for deep lore."""
         rng = random.Random(row_id)
         char = characters[row_id % len(characters)]
-        pool = anchors_by_char[char]
-        picked = rng.sample(pool, min(synth["anchors_per_gen"], len(pool)))
-        anchor_text = "\n---\n".join(a["text"][:synth["anchor_max_chars"]] for a in picked)
+        pool = anchors_by_char.get(char) or scenes
+        num_anchors = max(1, synth.get("anchors_per_gen", 1))
+        
+        # Primary anchor draw
+        picked = rng.sample(pool, min(num_anchors, len(pool)))
+        
+        # Bernoulli trial for cross-lore sampling from other characters/eras
+        if rng.random() < cross_sample_rate and len(scenes) > len(pool):
+            other_scenes = [s for s in scenes if s not in pool]
+            if other_scenes:
+                picked.append(rng.choice(other_scenes))
+                
+        anchor_blocks = []
+        for a in picked:
+            heading = a.get("chapter") or "Historical Excerpt"
+            body = a.get("text", "")[:synth["anchor_max_chars"]]
+            anchor_blocks.append(f"[{heading}]\n{body}")
+            
+        anchor_text = "\n\n---\n\n".join(anchor_blocks)
         turns_min, turns_max = rng.choice(TURN_RANGES)
-        return char, rng.choice(situations), anchor_text, turns_min, turns_max, rng.choice(behavior_mods)
+        sit = _deal_from(situations, _sit_deck, rng)
+        mod = _deal_from(behavior_mods, _mod_deck, rng)
+        return char, sit, anchor_text, turns_min, turns_max, mod
 
     pending = [i for i in range(synth["count"]) if i not in done]
     print(f"To generate: {len(pending)} rows")
@@ -257,6 +314,16 @@ def main():
         if len(turns) == 1:
             turns = synthesize_missing_turn(llm, turns, char, situation, anchor_text)
 
+        # Strip leaked imperative style instructions from the start of char turns
+        _leak_re = re.compile(r"^\s*(?:open|begin|start|frame|kick|launch|commence|lead)\b[^.\n]{0,120}\.\s*$", re.I)
+        for t in turns:
+            if t.get("role") == "char":
+                lines = t["text"].split("\n")
+                if len(lines) > 1 and _leak_re.match(lines[0]):
+                    rest = "\n".join(lines[1:]).lstrip()
+                    if rest:
+                        t["text"] = rest
+
         text = "\n".join(t["text"] for t in turns)
 
         def reject(reason):
@@ -294,13 +361,35 @@ def main():
                 n_rejected += 1
                 continue
 
+        # Blueprint C: First-reply opener cap check (active after 20 accepted rows)
+        first_char_turn = next((t["text"] for t in turns if t.get("role") == "char"), "")
+        fc_words = re.findall(r"[A-Za-z]+", first_char_turn.lower())
+        fw = fc_words[0] if fc_words else ""
+        frame = " ".join(fc_words[:2]) if len(fc_words) >= 2 else fw
+        if _first_reply_total >= 20 and fw:
+            if (_first_word_counts[fw] / _first_reply_total) > 0.30 or (
+                frame and (_opener_frame_counts[frame] / _first_reply_total) > 0.10
+            ):
+                reject(f"overused opener: '{frame}'")
+                n_rejected += 1
+                continue
+
+        _first_reply_total += 1
+        if fw:
+            _first_word_counts[fw] += 1
+        if frame:
+            _opener_frame_counts[frame] += 1
+
         accepted_grams.append(grams)
         gram_df.update(grams)
         append_jsonl(out_path, {"id": row_id, "source_id": None, "char": char,
-                                "user": "", "turns": turns,
+                                "user": "The Inquirer", "turns": turns,
                                 "anchor_overlap": anchor_overlap})
         n_ok += 1
         print(f"row {row_id}: OK ({char}, overlap {anchor_overlap}, {len(turns)} turns)")
+        trace_log = os.path.join(debug_dir, "stage_05_trace.log")
+        with open(trace_log, "a", encoding="utf-8") as tf:
+            tf.write(f"[STAGE 05][ACCEPT] row_id={row_id} char={char} turns={len(turns)} overlap={anchor_overlap}\n")
 
     print(f"\nDone: {n_ok} accepted, {n_rejected} rejected, {n_refusals} refusals -> {out_path}")
     if n_rejected > n_ok:

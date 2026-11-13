@@ -44,24 +44,37 @@ def normalize(text):
 
 
 MD_HEADING_RE = re.compile(r"^#{1,4}\s+(.+)$")
+SECTION_HEADING_RE = re.compile(r"^\*\*(?:\"[^\"]+\"|[^*]+)\*\*\s*$")
 
-def structural_blocks(text, chapter_re):
-    """Split on chapter headings, Markdown headers, and explicit scene breaks.
-    
-    Returns [(chapter_title, block_text)]. The chapter title is carried along so
-    the scenes can be traced back to their place in the source.
-    """
+def build_header_regex(cfg):
+    """Build a dynamic header regex from cfg['segment']['chapter_headers']."""
+    headers = cfg.get("segment", {}).get("chapter_headers", ["#", "##", "###", "####"])
+    if isinstance(headers, str):
+        headers = [h.strip() for h in headers.split(",") if h.strip()]
+    esc_headers = [re.escape(h) for h in headers if h]
+    if esc_headers:
+        pattern = r"^(?:" + "|".join(esc_headers) + r")\s+(.+)$"
+    else:
+        pattern = r"^#{1,4}\s+(.+)$"
+    return re.compile(pattern)
+
+def structural_blocks(text, chapter_re, md_heading_re):
+    """Split on chapter headings, Markdown headers, bold section titles, and explicit scene breaks."""
     blocks, current, chapter = [], [], ""
     for line in text.split("\n"):
         stripped = line.strip()
-        md_match = MD_HEADING_RE.match(stripped)
-        is_md_header = md_match and len(stripped) < 80
-        is_txt_chapter = chapter_re.match(line) and len(stripped) < 60
+        md_match = md_heading_re.match(stripped)
+        sec_match = SECTION_HEADING_RE.match(stripped)
+        
+        is_md_header = bool(md_match and len(stripped) < 150)
+        is_sec_header = bool(sec_match and len(stripped) < 100 and not stripped.startswith("**Intro"))
+        is_txt_chapter = bool(chapter_re.match(line) and len(stripped) < 100)
 
-        if is_md_header or is_txt_chapter:
+        if is_md_header or is_sec_header or is_txt_chapter:
             if current and "".join(current).strip():
                 blocks.append((chapter, "\n".join(current).strip()))
-            current, chapter = [], (md_match.group(1).strip() if md_match else stripped)
+            heading_title = md_match.group(1).strip() if md_match else stripped.strip("*").strip('"').strip()
+            current, chapter = [], heading_title
         elif SCENE_BREAK_RE.match(line):
             if current and "".join(current).strip():
                 blocks.append((chapter, "\n".join(current).strip()))
@@ -194,13 +207,20 @@ def split_by_boundaries(paragraphs, boundaries):
 
 
 def merge_short(scenes, min_chars):
-    """Glue undersized scenes to their neighbour."""
+    """Glue undersized scenes to their neighbour while preserving chapter metadata."""
     out = []
-    for scene in scenes:
-        if out and (len(scene) < min_chars or len(out[-1]) < min_chars):
-            out[-1] = out[-1] + "\n\n" + scene
-        else:
-            out.append(scene)
+    for item in scenes:
+        # Support both (chapter, text) tuples and bare text strings
+        chap, txt = item if isinstance(item, (tuple, list)) else ("", item)
+        if out:
+            prev_chap, prev_txt = out[-1]
+            # Only merge if either is under min_chars AND they belong to the same chapter
+            # (or if either chapter is unspecified)
+            same_chap = (prev_chap == chap or not prev_chap or not chap)
+            if (len(txt) < min_chars or len(prev_txt) < min_chars) and same_chap:
+                out[-1] = (prev_chap or chap, prev_txt + "\n\n" + txt)
+                continue
+        out.append((chap, txt))
     return out
 
 
@@ -240,28 +260,28 @@ def hard_split(text, max_chars):
 
 
 def cap_long(scenes, max_chars):
-    """Split oversized scenes on paragraph borders.
-
+    """Split oversized scenes on paragraph borders while preserving chapter metadata.
+    
     Never inside a paragraph while a paragraph border is available: a scene that
     ends mid-sentence produces a transcript that ends mid-sentence. When a single
-    paragraph is itself over the cap, hard_split takes over.
-    """
+    paragraph is itself over the cap, hard_split takes over."""
     out = []
-    for scene in scenes:
-        if len(scene) <= max_chars:
-            out.append(scene)
+    for item in scenes:
+        chap, txt = item if isinstance(item, (tuple, list)) else ("", item)
+        if len(txt) <= max_chars:
+            out.append((chap, txt))
             continue
         current, current_len = [], 0
-        for paragraph in paragraphs_of(scene):
+        for paragraph in paragraphs_of(txt):
             for piece in ([paragraph] if len(paragraph) <= max_chars
                           else hard_split(paragraph, max_chars)):
                 if current_len + len(piece) > max_chars and current:
-                    out.append("\n\n".join(current))
+                    out.append((chap, "\n\n".join(current)))
                     current, current_len = [], 0
                 current.append(piece)
                 current_len += len(piece) + 2
         if current:
-            out.append("\n\n".join(current))
+            out.append((chap, "\n\n".join(current)))
     return out
 
 
@@ -275,7 +295,8 @@ def main():
     source_file = resolve_input_path(cfg)
     print(f"Segmenting source: {source_file}")
     text = normalize(read_text(source_file, cfg["input"]["encodings"]))
-    blocks = structural_blocks(text, chapter_regex(pack, full_line=True))
+    md_heading_re = build_header_regex(cfg)
+    blocks = structural_blocks(text, chapter_regex(pack, full_line=True), md_heading_re)
     print(f"Structural pass: {len(blocks)} blocks")
 
     long_blocks = [b for b in blocks if len(b[1]) > segment["max_block_chars"]]
@@ -297,29 +318,34 @@ def main():
         for scene in split_by_boundaries(paragraphs, boundaries):
             collected.append((chapter, scene))
 
-    texts = [t for _, t in collected]
-    texts = merge_short(texts, segment["min_scene_chars"])
-    texts = cap_long(texts, segment["max_scene_chars"])
-    assert texts, "segmentation produced no scenes — check the source file"
+    # Process (chapter, scene_text) tuples directly through merge and cap passes
+    # Cap oversized scenes first, then merge undersized fragments, then enforce max ceiling
+    max_cap = int(segment["max_scene_chars"])
+    processed = cap_long(collected, max_cap)
+    processed = merge_short(processed, segment["min_scene_chars"])
+    processed = cap_long(processed, max_cap)
+    assert processed, "segmentation produced no scenes — check the source file"
 
-    # Re-attach chapter titles after merging and capping changed the boundaries.
-    # A scene keeps the title of the block its opening came from; scenes created
-    # by a split inherit the last title seen.
-    items, chapter_cursor = [], ""
-    for scene_id, scene_text in enumerate(texts):
-        head = scene_text[:60]
-        for chapter, block_text in collected:
-            if block_text.startswith(head):
-                chapter_cursor = chapter
-                break
-        items.append({"id": scene_id, "chapter": chapter_cursor,
-                      "text": scene_text, "chars": len(scene_text)})
+    items = []
+    for scene_id, (chapter_title, scene_text) in enumerate(processed):
+        items.append({
+            "id": scene_id,
+            "chapter": chapter_title,
+            "text": scene_text,
+            "chars": len(scene_text)
+        })
 
     output = work_path(cfg, "scenes.jsonl")
     write_jsonl(output, items)
 
     lengths = sorted(item["chars"] for item in items)
     oversized = [item for item in items if item["chars"] > segment["max_scene_chars"]]
+    
+    trace_log = os.path.join(debug_dir, "stage_01_trace.log")
+    with open(trace_log, "w", encoding="utf-8") as tf:
+        for it in items:
+            tf.write(f"[STAGE 01][SCENE] id={it['id']} chapter=\"{it['chapter']}\" chars={it['chars']}\n")
+
     print(f"\nDone: {len(items)} scenes -> {output}")
     if oversized:
         print(f"[!] {len(oversized)} scenes are still over segment.max_scene_chars "

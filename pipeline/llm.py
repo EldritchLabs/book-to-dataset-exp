@@ -109,9 +109,64 @@ def make_refusal_checker(extra_markers=()):
 
 
 _JSON_RE = re.compile(r"\{.*\}|\[.*\]", re.S)
-_THINK_CLOSED = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.S | re.I)
-_THINK_OPEN = re.compile(r"^<think(?:ing)?>", re.I)
-_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.M)
+_THINK_CLOSED = re.compile(r"<(?:think|thinking|reasoning|analysis|scratchpad)>.*?</(?:think|thinking|reasoning|analysis|scratchpad)\s*>", re.S | re.I)
+_THINK_OPEN = re.compile(r"^<(?:think|thinking|reasoning|analysis|scratchpad)>", re.I)
+_FENCE = re.compile(r"```[A-Za-z0-9_+-]*")
+
+
+def _json_objects_in(text):
+    """Yield every complete JSON value starting at `{` or `[` using raw_decode."""
+    decoder = json.JSONDecoder()
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index] not in "{[":
+            index += 1
+            continue
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except ValueError:
+            index += 1
+            continue
+        yield value
+        index = end if end > index else index + 1
+
+
+def _lenient_json(content):
+    """Normalize near-JSON: smart quotes, trailing commas, Python literals."""
+    text = content
+    for src, dst in (("\u201c", '"'), ("\u201d", '"'), ("\u2018", "'"),
+                     ("\u2019", "'"), ("\u00a0", " ")):
+        text = text.replace(src, dst)
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    text = re.sub(
+        r'(?<![\w"])(True|False|None)(?![\w"])',
+        lambda m: {"True": "true", "False": "false", "None": "null"}[m.group(1)],
+        text,
+    )
+    return text
+
+
+def _repair_truncated_json(content, max_steps=800):
+    """Trim back to the last complete member and close enclosing braces/brackets."""
+    body = (content or "").strip()
+    if not body:
+        return None
+    stop = max(0, len(body) - max_steps)
+    for end in range(len(body), stop, -1):
+        chunk = body[:end].rstrip()
+        if not chunk or chunk[-1] in "{[,:":
+            continue
+        chunk = re.sub(r",\s*$", "", chunk)
+        chunk += "]" * max(0, chunk.count("[") - chunk.count("]"))
+        chunk += "}" * max(0, chunk.count("{") - chunk.count("}"))
+        try:
+            value = json.loads(chunk)
+        except ValueError:
+            continue
+        if isinstance(value, (dict, list)) and value:
+            return value
+    return None
 
 
 def _repair_json_string(text):
@@ -170,7 +225,71 @@ def extract_json(text):
     except json.JSONDecodeError:
         pass
 
-    # Extract outermost balanced block { ... } or [ ... ]
+    # Ladder: raw_decode scan -> lenient JSON -> truncated JSON repair
+    for candidate in _json_objects_in(text):
+        if isinstance(candidate, (dict, list)) and candidate:
+            return candidate
+
+    lenient = _lenient_json(text)
+    if lenient != text:
+        try:
+            return json.loads(lenient)
+        except json.JSONDecodeError:
+            for candidate in _json_objects_in(lenient):
+                if isinstance(candidate, (dict, list)) and candidate:
+                    return candidate
+
+    repaired_trunc = _repair_truncated_json(text)
+    if repaired_trunc is not None:
+        return repaired_trunc
+
+    # Extract any balanced JSON object or array, including embedded objects with commentary before/after
+    # Find all outermost {...} blocks
+    for match in re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL):
+        snippet = match.group(0)
+        try:
+            return json.loads(snippet)
+        except Exception:
+            try:
+                return json.loads(_repair_json_string(snippet))
+            except Exception:
+                pass
+
+    # Find all outermost [...] blocks
+    for match in re.finditer(r'\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\]', text, re.DOTALL):
+        snippet = match.group(0)
+        try:
+            return json.loads(snippet)
+        except Exception:
+            try:
+                return json.loads(_repair_json_string(snippet))
+            except Exception:
+                pass
+
+    # Extract any balanced JSON object or array, including embedded objects with commentary before/after
+    # Find all outermost {...} blocks
+    for match in re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL):
+        snippet = match.group(0)
+        try:
+            return json.loads(snippet)
+        except Exception:
+            try:
+                return json.loads(_repair_json_string(snippet))
+            except Exception:
+                pass
+
+    # Find all outermost [...] blocks
+    for match in re.finditer(r'\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\]', text, re.DOTALL):
+        snippet = match.group(0)
+        try:
+            return json.loads(snippet)
+        except Exception:
+            try:
+                return json.loads(_repair_json_string(snippet))
+            except Exception:
+                pass
+
+    # Extract outermost balanced block { ... } or [ ... ] fallback
     match = _JSON_RE.search(text)
     if match:
         snippet = match.group(0)
