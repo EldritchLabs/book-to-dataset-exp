@@ -141,13 +141,23 @@ def main():
               "Step 06 will build the dataset from the converted scenes only.")
         return
 
-    pack = load_pack(cfg["lang"])
+    pack = load_pack(cfg["lang"], cfg=cfg)
     llm = LLM(cfg)
     workers = cfg["llm"]["workers"]
     is_refusal = make_refusal_checker(pack.refusal_markers)
 
-    situations = pack.require("synth.situations")
-    behavior_mods = pack.get("synth.behavior_mods", [""])
+    # If cycling is active, merge situation and behavior pools so coverage is comprehensive
+    if hasattr(pack, "packs"):
+        situations = []
+        behavior_mods = []
+        for p in pack.packs:
+            situations.extend(p.get("synth.situations", []) or [])
+            behavior_mods.extend(p.get("synth.behavior_mods", [""]) or [""])
+        situations = list(dict.fromkeys(situations))
+        behavior_mods = list(dict.fromkeys(behavior_mods))
+    else:
+        situations = pack.require("synth.situations")
+        behavior_mods = pack.get("synth.behavior_mods", [""])
     assert situations, "the language pack has an empty synth.situations list"
 
     # Blueprint C: Deck-dealing without replacement for situations & behavior_mods
@@ -251,12 +261,13 @@ def main():
         return
 
     def work(row_id):
+        active_pack = pack.for_index(row_id) if hasattr(pack, "for_index") else pack
         char, situation, anchor_text, turns_min, turns_max, modifier = ingredients(row_id)
-        prompt = render(pack.require("synth.user"), char=char, anchors=anchor_text,
+        prompt = render(active_pack.require("synth.user"), char=char, anchors=anchor_text,
                         situation=situation, turns_min=turns_min, turns_max=turns_max)
         if modifier:
             prompt += "\n" + modifier
-        system = render(pack.require("synth.system"), char=char)
+        system = render(active_pack.require("synth.system"), char=char)
         raw = llm.chat(system, prompt, temperature=synth["temperature"], json_mode=True)
         return raw, char, anchor_text, turns_min, situation
 

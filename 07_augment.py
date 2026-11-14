@@ -189,7 +189,7 @@ def load_rows(cfg, settings):
 
 def rewrite(cfg):
     settings = cfg["augment"]
-    pack = load_pack(cfg["lang"])
+    pack = load_pack(cfg["lang"], cfg=cfg)
     is_refusal = make_refusal_checker(pack.refusal_markers)
     openers = pack.require("openers")
     fallback_user = pack.fallback_user
@@ -290,10 +290,11 @@ def rewrite(cfg):
 
     def work(job):
         row, scene_text, combo, job_key = job
-        directives = [directive(pack, axis, value) for axis, value in sorted(combo.items())]
+        active_pack = pack.for_id(job_key) if hasattr(pack, "for_id") else pack
+        directives = [directive(active_pack, axis, value) for axis, value in sorted(combo.items())]
         raw = llm.chat(
-            pack.require("augment.system"),
-            render(pack.require("augment.user"),
+            active_pack.require("augment.system"),
+            render(active_pack.require("augment.user"),
                    scene=scene_text[:9000],
                    transcript=render_turns(row["turns"]),
                    directives="\n".join(f"- {d}" for d in directives)),

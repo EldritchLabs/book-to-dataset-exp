@@ -25,6 +25,9 @@ DEFAULTS = {
     # Language of THIS run. Selects prompts/<lang>.yaml. One run = one language.
     "lang": "en",
 
+    # Alternate between prompts/<lang>.yaml, prompts/<lang>2.yaml, <lang>3.yaml...
+    "prompt_cycle": False,
+
     "input": {
         # Plain UTF-8 text file: the novel, the log archive, whatever the source is.
         "path": "input/source.txt",

@@ -164,18 +164,129 @@ def _validate(pack):
     return pack
 
 
-def load_pack(lang):
-    """Load and validate prompts/<lang>.yaml."""
-    path = os.path.join(PROMPTS_DIR, f"{lang}.yaml")
-    if not os.path.exists(path):
+class PromptCyclePack:
+    """Wrapper over multiple language packs (e.g. en.yaml, en2.yaml, en3.yaml).
+
+    Alternates between packs on consecutive property accesses and render/require calls,
+    or returns an exact deterministic pack via `pack.for_index(i)` or `pack.for_id(item_id)`.
+    """
+
+    def __init__(self, packs):
+        assert packs, "PromptCyclePack requires at least one LanguagePack"
+        self._packs = packs
+        self._cursor = 0
+
+    def for_index(self, index):
+        """Deterministically choose a language pack variant by integer index."""
+        try:
+            idx = int(index)
+        except (TypeError, ValueError):
+            idx = 0
+        return self._packs[idx % len(self._packs)]
+
+    def for_id(self, item_id):
+        """Deterministically choose a language pack variant seeded by item id."""
+        try:
+            import hashlib
+            digest = hashlib.sha1(str(item_id).encode("utf-8")).hexdigest()
+            idx = int(digest[:8], 16)
+        except Exception:
+            idx = 0
+        return self._packs[idx % len(self._packs)]
+
+    def _next_pack(self):
+        pack = self._packs[self._cursor % len(self._packs)]
+        self._cursor += 1
+        return pack
+
+    def get(self, dotted, default=None):
+        return self._next_pack().get(dotted, default=default)
+
+    def require(self, dotted):
+        return self._next_pack().require(dotted)
+
+    @property
+    def packs(self):
+        return self._packs
+
+    @property
+    def lang(self):
+        return self._packs[0].lang
+
+    @property
+    def unknown_speaker(self):
+        return self._packs[0].unknown_speaker
+
+    @property
+    def generic_speakers(self):
+        # Union across all cycled packs so speaker filtering remains clean
+        out = set()
+        for p in self._packs:
+            out |= p.generic_speakers
+        return out
+
+    @property
+    def stem_length(self):
+        return self._packs[0].stem_length
+
+    @property
+    def refusal_markers(self):
+        out = []
+        for p in self._packs:
+            out.extend(p.refusal_markers)
+        return list(dict.fromkeys(out))
+
+    @property
+    def fallback_user(self):
+        return self._packs[0].fallback_user
+
+    @property
+    def fallback_char(self):
+        return self._packs[0].fallback_char
+
+
+def load_pack(lang, cfg=None):
+    """Load and validate prompts/<lang>.yaml or cycle across <lang>.yaml, <lang>2.yaml, ..."""
+    base_path = os.path.join(PROMPTS_DIR, f"{lang}.yaml")
+    if not os.path.exists(base_path):
         available = sorted(f[:-5] for f in os.listdir(PROMPTS_DIR) if f.endswith(".yaml"))
         raise SystemExit(
             f"\nNo language pack for lang: {lang}\n"
             f"Available: {', '.join(available)}\n"
             f"To add one: cp prompts/en.yaml prompts/{lang}.yaml and translate the strings.\n")
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    return _validate(LanguagePack(lang, data, path))
+
+    should_cycle = False
+    if isinstance(cfg, dict):
+        should_cycle = bool(cfg.get("prompt_cycle", False))
+
+    if not should_cycle:
+        with open(base_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return _validate(LanguagePack(lang, data, base_path))
+
+    # Collect <lang>.yaml, <lang>2.yaml, <lang>3.yaml ... in order
+    pack_paths = [base_path]
+    idx = 2
+    while True:
+        next_path = os.path.join(PROMPTS_DIR, f"{lang}{idx}.yaml")
+        if os.path.exists(next_path):
+            pack_paths.append(next_path)
+            idx += 1
+        else:
+            break
+
+    packs = []
+    for p in pack_paths:
+        with open(p, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        packs.append(_validate(LanguagePack(lang, data, p)))
+
+    if len(packs) > 1:
+        names = [os.path.basename(p.path) for p in packs]
+        print(f"[prompt_cycle] Cycling active across {len(packs)} packs: {', '.join(names)}")
+        return PromptCyclePack(packs)
+
+    return packs[0]
 
 
 def render(template, **values):

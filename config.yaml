@@ -11,6 +11,9 @@
 # Language of this run. Selects prompts/<lang>.yaml.
 lang: en
 
+# If true, alternates between prompts/en.yaml, en2.yaml, en3.yaml, etc.
+prompt_cycle: true
+
 input:
   # Plain text file. UTF-8 is best; other encodings are detected and reported.
   path: input/source.txt
@@ -118,8 +121,8 @@ synth:
   # names by hand: ["Name One", "Name Two"]
   chars: []
   # Priority character pool for this lorebook/novel:
-  priority_chars: ["The Chronicler", "Legion Chronicler", "Connacht", "Alric", "Soulblighter", "The Deceiver", "Damas", "Myrdred"]
-  chars_limit: 8
+  priority_chars: [] # ["The Chronicler", "Legion Chronicler", "Connacht", "Alric", "Soulblighter", "The Deceiver", "Damas", "Myrdred"]
+  chars_limit: 16
   # Bernoulli trial probability for cross-entity lore anchor sampling
   cross_sample_rate: 0.25
 

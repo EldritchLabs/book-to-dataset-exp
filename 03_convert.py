@@ -285,7 +285,7 @@ def pick_pair(scene, forced_char, unknown, generic, invalid_set=None, fallback_c
 def main():
     args = parse_args(__doc__.splitlines()[0])
     cfg = load_config(args.config)
-    pack = load_pack(cfg["lang"])
+    pack = load_pack(cfg["lang"], cfg=cfg)
     convert = cfg["convert"]
     llm = LLM(cfg)
     workers = cfg["llm"]["workers"]
@@ -421,11 +421,12 @@ def main():
             )
             return llm.chat(system_prompt, user_prompt, temperature=convert["temperature"], json_mode=True)
 
+        active_pack = pack.for_id(scene["id"]) if hasattr(pack, "for_id") else pack
         attribution = "; ".join(
             f"\"{line.get('quote', '')}...\" — {line.get('speaker', '')}"
             for line in scene.get("lines", []))
         user_prompt = render(
-            pack.require("convert.user"),
+            active_pack.require("convert.user"),
             scene=scene["text"], char=scene["_char"],
             user=scene["_user"], attribution=attribution
         )
