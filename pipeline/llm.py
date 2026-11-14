@@ -147,11 +147,25 @@ def _lenient_json(content):
     return text
 
 
-def _repair_truncated_json(content, max_steps=800):
+def _repair_truncated_json(content, max_steps=1200):
     """Trim back to the last complete member and close enclosing braces/brackets."""
     body = (content or "").strip()
     if not body:
         return None
+
+    # First attempt: if cut off inside a string, close the quote and close brackets
+    for quote_close in ('"\n}', '"}', '"\n]}', '"]}'):
+        test_chunk = body + quote_close
+        test_chunk = re.sub(r",\s*([\]}])", r"\1", test_chunk)
+        test_chunk += "]" * max(0, test_chunk.count("[") - test_chunk.count("]"))
+        test_chunk += "}" * max(0, test_chunk.count("{") - test_chunk.count("}"))
+        try:
+            val = json.loads(test_chunk)
+            if isinstance(val, (dict, list)) and val:
+                return val
+        except Exception:
+            pass
+
     stop = max(0, len(body) - max_steps)
     for end in range(len(body), stop, -1):
         chunk = body[:end].rstrip()
@@ -315,45 +329,66 @@ def extract_json(text):
         except Exception:
             pass
 
-    # Salvage turns list from broken/truncated JSON transcripts:
-    # Use non-greedy match between role tags to safely capture dialogue containing quotes
-    if ('"role"' in text or "'role'" in text) and ('"text"' in text or "'text'" in text):
-        pattern = re.compile(
-            r'\{\s*["\']role["\']\s*:\s*["\'](char|user)["\']\s*,\s*["\']text["\']\s*:\s*["\'](.*?)["\']\s*(?:\}|$)',
+    ROLE_ALIAS_MAP = {
+        "char": "char", "character": "char", "assistant": "char",
+        "gpt": "char", "model": "char", "bot": "char",
+        "user": "user", "human": "user", "player": "user"
+    }
+
+    # Universal turn extractor for any list of turns or dict key-values
+    turn_pattern = re.compile(
+        r'\{\s*["\'](?:role|from)["\']\s*:\s*["\']([a-zA-Z0-9_-]+)["\']\s*,\s*["\'](?:text|content|value)["\']\s*:\s*["\'](.*?)(?:["\']\s*\}|\Z)',
+        re.DOTALL | re.IGNORECASE
+    )
+    turn_matches = turn_pattern.findall(text)
+    if not turn_matches:
+        rev_pattern = re.compile(
+            r'\{\s*["\'](?:text|content|value)["\']\s*:\s*["\'](.*?)["\']\s*,\s*["\'](?:role|from)["\']\s*:\s*["\']([a-zA-Z0-9_-]+)["\']\s*(?:\}|\Z)',
             re.DOTALL | re.IGNORECASE
         )
-        turn_matches = pattern.findall(text)
-        if not turn_matches:
-            # Try reverse key order: text first, role second
-            rev_pattern = re.compile(
-                r'\{\s*["\']text["\']\s*:\s*["\'](.*?)["\']\s*,\s*["\']role["\']\s*:\s*["\'](char|user)["\']\s*(?:\}|$)',
-                re.DOTALL | re.IGNORECASE
+        rev_matches = rev_pattern.findall(text)
+        if rev_matches:
+            turn_matches = [(r, t) for (t, r) in rev_matches]
+
+    if turn_matches:
+        salvaged_turns = []
+        for raw_role, body in turn_matches:
+            r = ROLE_ALIAS_MAP.get(raw_role.lower(), "char" if len(salvaged_turns) % 2 == 1 else "user")
+            cleaned_body = (
+                body.replace('\\"', '"')
+                    .replace("\\'", "'")
+                    .replace('\\n', '\n')
+                    .replace('\\t', '\t')
+                    .strip()
+                    .rstrip('\\"\'')
             )
-            rev_matches = rev_pattern.findall(text)
-            if rev_matches:
-                turn_matches = [(r, t) for (t, r) in rev_matches]
+            if cleaned_body:
+                if cleaned_body[-1] not in ('.', '!', '?', '"', "'", '*', '»', '”'):
+                    cleaned_body += "..."
+                salvaged_turns.append({"role": r, "text": cleaned_body})
+        if salvaged_turns:
+            return {"turns": salvaged_turns}
 
-        if turn_matches:
-            salvaged_turns = []
-            for role, body in turn_matches:
-                cleaned_body = (
-                    body.replace('\\"', '"')
-                        .replace("\\'", "'")
-                        .replace('\\n', '\n')
-                        .replace('\\t', '\t')
-                        .strip()
-                )
-                if cleaned_body:
-                    salvaged_turns.append({"role": role.lower(), "text": cleaned_body})
-            if salvaged_turns:
-                return {"turns": salvaged_turns}
-
-    # Tagged block fallback: [user] or [char]
-    tagged = re.findall(r'\[(char|user)\]\s*[:\-]?\s*(.*?)(?=\n\s*\[(?:char|user)\]|\Z)', text, re.DOTALL | re.IGNORECASE)
+    # Tagged block fallback: [user] or [char] / [assistant]
+    tagged = re.findall(r'\[(char|character|assistant|gpt|user|human)\]\s*[:\-]?\s*(.*?)(?=\n\s*\[(?:char|character|assistant|gpt|user|human)\]|\Z)', text, re.DOTALL | re.IGNORECASE)
     if tagged:
-        salvaged = [{"role": role.lower(), "text": body.strip()} for role, body in tagged if body.strip()]
+        salvaged = []
+        for role, body in tagged:
+            r = ROLE_ALIAS_MAP.get(role.lower(), "char")
+            b = body.strip()
+            if b:
+                if b[-1] not in ('.', '!', '?', '"', "'", '*'):
+                    b += "..."
+                salvaged.append({"role": r, "text": b})
         if salvaged:
             return {"turns": salvaged}
+
+    # Absolute fallback: if entire reply is unparsed text, return it as a character turn
+    clean_all = text.strip().rstrip('\\"\'')
+    if len(clean_all) > 40:
+        if clean_all[-1] not in ('.', '!', '?', '"', "'", '*'):
+            clean_all += "..."
+        return {"turns": [{"role": "char", "text": clean_all}]}
 
     raise ValueError(f"Unable to extract or repair JSON: {text[:200]}...")
 

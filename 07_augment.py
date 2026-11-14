@@ -64,6 +64,39 @@ from pipeline.sharegpt import normalize_entry, to_sharegpt
 from pipeline.textstats import build_df, overlap, rarity_cutoff, retention, pareto_repair_turn_text
 
 
+def finish_truncated_text(text):
+    """Cleanly close text cut off mid-sentence without making extra LLM calls."""
+    if not text:
+        return ""
+    clean = text.strip()
+    if not clean:
+        return ""
+    # Already cleanly terminated
+    if clean[-1] in ('.', '!', '?', '"', "'", '*', '»', '”'):
+        return clean
+
+    # Find the last sentence-ending punctuation mark
+    last_punct = -1
+    for p in ('.', '!', '?', '»', '”'):
+        pos = clean.rfind(p)
+        if pos > last_punct:
+            last_punct = pos
+
+    # If a sentence boundary exists and isn't too far back, roll back to it
+    if last_punct > 0 and (len(clean) - last_punct) < 250:
+        clean = clean[:last_punct + 1].strip()
+    else:
+        # Otherwise, cap with an ellipsis
+        clean = clean.rstrip(' ,;:-') + "..."
+
+    # Ensure unclosed double quotes are balanced
+    if clean.count('"') % 2 != 0:
+        clean += '"'
+    if clean.count('\u201c') > clean.count('\u201d'):
+        clean += '\u201d'
+    return clean
+
+
 def render_turns(turns):
     """The transcript as the model sees it."""
     return "\n\n".join(f"[{t['role']}] {t['text']}" for t in turns)
@@ -96,6 +129,13 @@ def check_variant(new_turns, old_turns, scene_text, combo, df, cutoff, settings,
 
     new_text = "\n".join(t["text"] for t in repaired_turns if t["role"] == "char")
     old_text = "\n".join(t["text"] for t in old_turns if t["role"] == "char")
+    
+    # If role assignment failed, treat all turn text as new_text
+    if not new_text.strip():
+        new_text = "\n".join(t["text"] for t in repaired_turns)
+        if repaired_turns:
+            repaired_turns[-1]["role"] = "char"
+
     if not new_text.strip():
         return False, "empty", 0.0, repaired_turns
     if is_refusal(new_text):
@@ -300,30 +340,56 @@ def rewrite(cfg):
                    directives="\n".join(f"- {d}" for d in directives)),
             temperature=settings["temperature"], json_mode=True)
         
+        ROLE_MAP = {
+            "char": "char", "character": "char", "assistant": "char",
+            "gpt": "char", "model": "char", "bot": "char",
+            "user": "user", "human": "user"
+        }
+
         data = None
         try:
             data = extract_json(raw)
         except Exception:
-            turn_blocks = re.findall(
-                r'["\']role["\']\s*:\s*["\'](user|char)["\']\s*,\s*["\']text["\']\s*:\s*["\'](.*?)["\']\s*\}',
-                raw,
-                re.DOTALL
-            )
-            if not turn_blocks:
-                turn_blocks = re.findall(r'\[(char|user)\]\s*[:\-]?\s*(.*?)(?=\n\s*\[(?:char|user)\]|\Z)', raw, re.DOTALL | re.IGNORECASE)
-            if turn_blocks:
-                salvaged = []
-                for role, txt in turn_blocks:
-                    clean_txt = txt.replace('\\"', '"').replace('\\n', '\n').strip()
-                    if clean_txt:
-                        salvaged.append({"role": role.lower(), "text": clean_txt})
-                if salvaged:
-                    data = {"turns": salvaged}
+            pass
 
-        raw_turns = data if isinstance(data, list) else (data.get("turns", []) if isinstance(data, dict) else [])
-        turns = [t for t in raw_turns
-                 if isinstance(t, dict) and t.get("role") in ("char", "user")
-                 and str(t.get("text", "")).strip()]
+        raw_turns = []
+        if isinstance(data, list):
+            raw_turns = data
+        elif isinstance(data, dict):
+            raw_turns = data.get("turns") or data.get("messages") or data.get("conversations") or []
+            if not raw_turns and "role" in data:
+                raw_turns = [data]
+
+        turns = []
+        for i, t in enumerate(raw_turns):
+            if isinstance(t, dict):
+                r_raw = str(t.get("role") or t.get("from") or "").lower()
+                r = ROLE_MAP.get(r_raw, "char" if i % 2 == 1 else "user")
+                val = str(t.get("text") or t.get("content") or t.get("value") or "").strip()
+                if val:
+                    turns.append({"role": r, "text": val})
+            elif isinstance(t, str) and t.strip():
+                turns.append({"role": "char" if i % 2 == 1 else "user", "text": t.strip()})
+
+        # If json extraction gave 0 character turns, rescue from raw string directly
+        if not any(t.get("role") == "char" for t in turns):
+            clean_raw = raw.strip()
+            # Remove fences and trailing brackets if present
+            clean_raw = re.sub(r"^```(?:json)?\s*|```$", "", clean_raw).strip()
+            # If the raw output contains speech/paragraphs, rescue it as the char turn
+            rescued_text = re.sub(r'^\s*\[?\s*\{\s*["\'](?:role|from)["\']\s*:\s*["\'][^"\']+["\']\s*,\s*["\'](?:text|content|value)["\']\s*:\s*["\']', '', clean_raw)
+            rescued_text = re.sub(r'["\']\s*\}?\s*\]?\s*$', '', rescued_text).strip()
+            if len(rescued_text) > 40:
+                turns = [
+                    {"role": "user", "text": row["turns"][0]["text"] if row.get("turns") else "Continue."},
+                    {"role": "char", "text": rescued_text}
+                ]
+
+        # Auto-complete cutoffs if generation terminated mid-sentence
+        for t in turns:
+            if t.get("role") == "char" and t["text"]:
+                t["text"] = finish_truncated_text(t["text"])
+
         return turns, combo, directives, job_key
 
     print(f"\nTotal jobs: {len(jobs)} | Pending: {len(pending_jobs)} | Workers: {workers}\n")

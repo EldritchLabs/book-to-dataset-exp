@@ -487,6 +487,12 @@ def main():
                 if tag_blocks:
                     turn_blocks = [(role.lower(), txt) for (role, txt) in tag_blocks]
 
+            # 4. Truncated unclosed final turn recovery
+            if not turn_blocks:
+                unclosed = re.search(r'["\']role["\']\s*:\s*["\'](user|char)["\']\s*,\s*["\']text["\']\s*:\s*["\'](.*?)(?:\Z)', raw, re.DOTALL)
+                if unclosed:
+                    turn_blocks = [(unclosed.group(1), unclosed.group(2))]
+
             if turn_blocks:
                 salvaged = []
                 for role, txt in turn_blocks:
@@ -495,7 +501,12 @@ def main():
                            .replace('\\n', '\n')
                            .replace('\\t', '\t')
                            .strip()
+                           .rstrip('\\"\'')
                     )
+                    if clean_txt and clean_txt[-1] not in ('.', '!', '?', '"', "'", '*', '»', '”'):
+                        clean_txt = clean_txt.rstrip(' ,;:-') + "..."
+                        if clean_txt.count('"') % 2 != 0:
+                            clean_txt += '"'
                     if clean_txt:
                         salvaged.append({"role": role, "text": clean_txt})
                 if salvaged:
@@ -530,23 +541,34 @@ def main():
             clean_raw.append(t)
         raw_turns = clean_raw
 
+        ROLE_MAP = {
+            "char": "char", "character": "char", "assistant": "char",
+            "gpt": "char", "model": "char", "bot": "char",
+            "user": "user", "human": "user"
+        }
+
         turns = []
         for i, turn in enumerate(raw_turns):
             if isinstance(turn, dict):
-                # Pattern A: Standard {"role": "char", "text": "..."}
-                role = turn.get("role")
-                text_val = str(turn.get("text") or turn.get("turn") or "").strip()
+                role_raw = str(turn.get("role") or turn.get("from") or "").lower()
+                role = ROLE_MAP.get(role_raw)
+                text_val = str(turn.get("text") or turn.get("content") or turn.get("value") or turn.get("turn") or "").strip()
                 
-                # Pattern B: {"char": "text"} or {"user": "text"}
+                # Pattern B: {"char": "text"} or {"user": "text"} or {"assistant": "text"}
                 if not text_val:
-                    if "char" in turn and str(turn["char"]).strip():
-                        role = "char"
-                        text_val = str(turn["char"]).strip()
-                    elif "user" in turn and str(turn["user"]).strip():
-                        role = "user"
-                        text_val = str(turn["user"]).strip()
-                    else:
-                        # Pattern C: Dict keys as dialogue statements (e.g. convert_dropped_49)
+                    for k_name in ("char", "character", "assistant", "gpt", "model"):
+                        if k_name in turn and str(turn[k_name]).strip():
+                            role = "char"
+                            text_val = str(turn[k_name]).strip()
+                            break
+                    if not text_val:
+                        for u_name in ("user", "human"):
+                            if u_name in turn and str(turn[u_name]).strip():
+                                role = "user"
+                                text_val = str(turn[u_name]).strip()
+                                break
+                    if not text_val:
+                        # Pattern C: Dict keys as dialogue statements
                         for k, v in turn.items():
                             k_str, v_str = str(k).strip(), str(v).strip()
                             if len(k_str) > 20 and not k_str.startswith("{"):
@@ -557,8 +579,8 @@ def main():
 
                 if not text_val:
                     continue
-                if role not in ("char", "user"):
-                    role = "char" if i % 2 == 0 else "user"
+                if not role:
+                    role = "char" if i % 2 == 1 else "user"
                 text_val = normalize_quotes(collapse_repeated_words(text_val))
                 turns.append({"role": role, "text": text_val})
             elif isinstance(turn, str) and turn.strip():
