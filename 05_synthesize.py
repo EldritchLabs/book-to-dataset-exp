@@ -282,6 +282,18 @@ def main():
         raw, char, anchor_text, turns_min, situation = result
         data = None
 
+        ROLE_MAP = {
+            "char": "char", "character": "char", "assistant": "char",
+            "gpt": "char", "model": "char", "bot": "char",
+            "user": "user", "human": "user", "player": "user",
+            "interlocutor": "user", "inquirer": "user"
+        }
+        if char:
+            ROLE_MAP[char.lower()] = "char"
+            for part in char.lower().split():
+                if len(part) > 2:
+                    ROLE_MAP[part] = "char"
+
         try:
             data = extract_json(raw)
         except Exception as exc:  # noqa: BLE001
@@ -290,36 +302,106 @@ def main():
                 n_refusals += 1
                 print(f"row {row_id}: model refused — not marked done")
                 continue
+            data = None
 
-            # Turn-level salvage for synthetic rows
-            turn_blocks = re.findall(
-                r'["\']role["\']\s*:\s*["\'](user|char)["\']\s*,\s*["\']text["\']\s*:\s*["\'](.*?)["\']\s*\}',
-                raw,
-                re.DOTALL
+        raw_turns = []
+        if isinstance(data, dict):
+            raw_turns = (
+                data.get("turns")
+                or data.get("messages")
+                or data.get("conversations")
+                or data.get("session")
+                or []
             )
+            if not raw_turns and ("role" in data or "from" in data):
+                raw_turns = [data]
+        elif isinstance(data, list):
+            raw_turns = data
+
+        turns = []
+        for i, t in enumerate(raw_turns):
+            if isinstance(t, dict):
+                r_val = str(t.get("role") or t.get("from") or t.get("speaker") or "").strip().lower()
+                role = ROLE_MAP.get(r_val)
+                text_val = str(
+                    t.get("text")
+                    or t.get("content")
+                    or t.get("value")
+                    or t.get("turn")
+                    or t.get("line")
+                    or t.get("dialogue")
+                    or t.get("message")
+                    or ""
+                ).strip()
+
+                # Key-as-role fallback: {"char": "..."}, {"user": "..."}
+                if not text_val:
+                    for k_name in ("char", "character", "assistant", "gpt", "model"):
+                        if k_name in t and str(t[k_name]).strip():
+                            role = "char"
+                            text_val = str(t[k_name]).strip()
+                            break
+                    if not text_val:
+                        for u_name in ("user", "human", "interlocutor"):
+                            if u_name in t and str(t[u_name]).strip():
+                                role = "user"
+                                text_val = str(t[u_name]).strip()
+                                break
+
+                if text_val:
+                    if not role:
+                        role = "user" if i % 2 == 0 else "char"
+                    turns.append({"role": role, "text": text_val})
+            elif isinstance(t, str) and t.strip():
+                turns.append({"role": "user" if i % 2 == 0 else "char", "text": t.strip()})
+
+        # Secondary regex salvage if structured parsing returned 0 turns
+        if not turns and raw:
+            # Pattern A: {"role": "...", "text": "..."} with relaxed role & text keys
+            turn_blocks = re.findall(
+                r'\{\s*["\'](?:role|from|speaker)["\']\s*:\s*["\']([^"\']+)["\']\s*,\s*["\'](?:text|content|value|line)["\']\s*:\s*["\'](.*?)(?<!\\)["\']\s*\}',
+                raw,
+                re.DOTALL | re.IGNORECASE
+            )
+            # Pattern B: Reverse key order
             if not turn_blocks:
-                turn_blocks = re.findall(r'\[(char|user)\]\s*[:\-]?\s*(.*?)(?=\n\s*\[(?:char|user)\]|\Z)', raw, re.DOTALL | re.IGNORECASE)
+                rev_blocks = re.findall(
+                    r'\{\s*["\'](?:text|content|value|line)["\']\s*:\s*["\'](.*?)(?<!\\)["\']\s*,\s*["\'](?:role|from|speaker)["\']\s*:\s*["\']([^"\']+)["\']\s*\}',
+                    raw,
+                    re.DOTALL | re.IGNORECASE
+                )
+                if rev_blocks:
+                    turn_blocks = [(r, t) for (t, r) in rev_blocks]
 
-            if turn_blocks:
-                salvaged = []
-                for role, txt in turn_blocks:
-                    clean_txt = txt.replace('\\"', '"').replace('\\n', '\n').strip()
-                    if clean_txt:
-                        salvaged.append({"role": role.lower(), "text": clean_txt})
-                if salvaged:
-                    data = {"turns": salvaged}
+            # Pattern C: Tagged bracket blocks [user] / [char] / [Name]
+            if not turn_blocks:
+                tag_blocks = re.findall(
+                    r'\[([a-zA-Z0-9_\s\'-]{2,30})\]\s*[:\-]?\s*(.*?)(?=\n\s*\[[a-zA-Z0-9_\s\'-]{2,30}\]|\Z)',
+                    raw,
+                    re.DOTALL
+                )
+                if tag_blocks:
+                    turn_blocks = tag_blocks
 
-            if data is None:
-                fail_file = os.path.join(debug_dir, f"synth_fail_{row_id}.txt")
-                with open(fail_file, "w", encoding="utf-8") as f:
-                    f.write(f"--- ERROR: {exc} ---\n\n" + (raw or ""))
-                print(f"  [warn] row {row_id}: invalid JSON (logged to {fail_file})", file=sys.stderr)
-                continue
+            for i, (r_name, txt) in enumerate(turn_blocks):
+                role = ROLE_MAP.get(r_name.strip().lower(), "user" if i % 2 == 0 else "char")
+                clean_txt = (
+                    txt.replace('\\"', '"')
+                       .replace("\\'", "'")
+                       .replace('\\n', '\n')
+                       .replace('\\t', '\t')
+                       .strip()
+                       .rstrip('\\"\'')
+                )
+                if clean_txt:
+                    turns.append({"role": role, "text": clean_txt})
 
-        raw_turns = data.get("turns", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        turns = [t for t in raw_turns
-                 if isinstance(t, dict) and t.get("role") in ("user", "char")
-                 and str(t.get("text", "")).strip()]
+        # Forensic logging: dump raw reply if turns is still 0
+        if not turns:
+            fail_file = os.path.join(debug_dir, f"synth_fail_{row_id}.txt")
+            with open(fail_file, "w", encoding="utf-8") as f:
+                f.write(f"--- FAILED TO PARSE TURNS (char={char}) ---\n\n" + (raw or ""))
+            print(f"  [warn] row {row_id}: could not parse turns (logged to {fail_file})", file=sys.stderr)
 
         # Auto-complete single-turn generations (Q without A, or A without Q)
         if len(turns) == 1:
@@ -340,10 +422,14 @@ def main():
         def reject(reason):
             append_jsonl(reject_path, {"id": row_id, "reject_reason": reason})
             print(f"row {row_id}: REJECT {reason}")
+            trace_log = os.path.join(debug_dir, "stage_05_trace.log")
+            with open(trace_log, "a", encoding="utf-8") as tf:
+                tf.write(f"[STAGE 05][REJECT] row_id={row_id} char={char} reason=\"{reason}\"\n")
 
         min_turns = min(turns_min, 2)
         if len(turns) < min_turns or not any(t["role"] == "char" for t in turns):
-            reject(f"too few turns: {len(turns)} < {min_turns}")
+            has_char = any(t.get("role") == "char" for t in turns)
+            reject(f"too few turns: {len(turns)} < {min_turns} (has_char={has_char})")
             n_rejected += 1
             continue
 

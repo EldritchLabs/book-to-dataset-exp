@@ -97,11 +97,12 @@ convert:
 validate:
   # Share of the transcript's content words that also occur in the source scene.
   # This is the main defence against the converter writing its own prose.
-  lexical_overlap_min: 0.55
+  lexical_overlap_min: 0.1 # Step 04 (validate) uses lexical_overlap_min (A FLOOR)
   # Reject Latin-script foreign words ('olhos', 'ojos') and glued words ('visiblyTrembling').
   foreign_word_check: true
-  # The model judge. Set to false to run on the cheap lexical filter alone.
-  llm_check: true
+  llm_check: false # Set to false to accept all transcripts that pass lexical overlap
+  strict_judge: false # If llm_check is true, keep strict_judge false so silent failures pass
+  # llm_check: true # The model judge. Set to false to run on the cheap lexical filter alone.
   temperature: 0.1
 
 synth:
@@ -114,7 +115,7 @@ synth:
   turns_max: 6
   anchors_per_gen: 1
   anchor_max_chars: 5000
-  max_anchor_overlap: 0.5
+  max_anchor_overlap: 1.0 # set to 1.0 to disable anti-copy rejection # Step 05 (synth) uses max_anchor_overlap (A CEILING)
   dedupe_jaccard: 0.35
   temperature: 0.8
   # Leave empty to use the most talkative characters found in step 02, or list

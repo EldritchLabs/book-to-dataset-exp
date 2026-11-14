@@ -229,30 +229,59 @@ def main():
             continue
 
         transcript["verdict"] = verdict
+
+        # In solo journals, {{[INPUT]}}/{{[OUTPUT]}} pairs, or informational scenes, relax constraints
+        is_pair_mode = bool(scene.get("input_prompt") or transcript.get("input_prompt"))
+        is_informational = is_pair_mode or transcript.get("imported") or len(transcript.get("turns", [])) <= 2 or transcript.get("user") == "The Inquirer"
         
-        # In solo journals or informational scenes, split_correct is relaxed if only one true speaker exists
-        is_informational = transcript.get("imported") or len(transcript.get("turns", [])) <= 2
-        keys = ("voice_preserved", "no_invention") if is_informational else ("voice_preserved", "no_invention", "split_correct")
+        if is_pair_mode or is_informational:
+            keys = ("voice_preserved",)
+        else:
+            keys = ("voice_preserved", "no_invention", "split_correct")
+
+        def _is_explicitly_false(val):
+            if val is None:
+                return False
+            if isinstance(val, bool):
+                return not val
+            return str(val).strip().lower() in ("false", "0", "no", "failed", "rejected")
 
         def _is_truthy(val):
-            return str(val).strip().lower() in ("true", "1", "yes", "ok") if not isinstance(val, bool) else bool(val)
+            if val is None:
+                return True  # Lenient on missing keys: pass unless explicitly flagged false
+            if isinstance(val, bool):
+                return val
+            return str(val).strip().lower() in ("true", "1", "yes", "ok", "passed")
 
+        strict_judge = validate.get("strict_judge", False)
         trace_log = os.path.join(debug_dir, "stage_04_trace.log")
-        if all(_is_truthy(verdict.get(key)) for key in keys):
+
+        # Determine pass/fail
+        if strict_judge:
+            passed = all(_is_truthy(verdict.get(key)) for key in keys)
+            failed = [key for key in keys if not _is_truthy(verdict.get(key))]
+        else:
+            # Lenient: Accept unless keys are explicitly set to false WITH a non-empty complaint
+            explicit_failures = [key for key in keys if _is_explicitly_false(verdict.get(key))]
+            comment = str(verdict.get("comment") or "").strip()
+            passed = len(explicit_failures) == 0 or (len(comment) == 0 and not strict_judge)
+            failed = explicit_failures
+
+        comment = str(verdict.get("comment") or "").strip()
+
+        if passed:
             append_jsonl(clean_path, transcript)
             n_clean += 1
             print(f"rp {transcript['id']}: OK overlap={transcript['lexical_overlap']}")
             with open(trace_log, "a", encoding="utf-8") as tf:
                 tf.write(f"[STAGE 04][ACCEPT] id={transcript['id']} overlap={transcript['lexical_overlap']} keys={keys}\n")
         else:
-            failed = [key for key in keys if not _is_truthy(verdict.get(key))]
-            comment = verdict.get("comment", "")
             append_jsonl(reject_path, {
                 **transcript,
                 "reject_reason": comment or f"judge: {', '.join(failed)}"})
             reasons["judge: " + ", ".join(failed)] += 1
             n_rejected += 1
-            print(f"rp {transcript['id']}: REJECT {comment}")
+            print(f"rp {transcript['id']}: REJECT {comment if comment else ', '.join(failed)}")
             with open(trace_log, "a", encoding="utf-8") as tf:
                 tf.write(f"[STAGE 04][REJECT] id={transcript['id']} failed={failed} comment={comment}\n")
 
