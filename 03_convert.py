@@ -175,18 +175,45 @@ def repair_and_filter_scenes(cfg, debug_dir):
     return out_path
 
 
-def chunk_prose_to_progressive_turns(text, chapter_name="", user_probes=None):
+def synthesize_custom_probes(llm, text, count=6):
+    """Ping the LLM to generate context-specific user continuation probes instead of generic defaults."""
+    try:
+        raw = llm.chat(
+            "You are a roleplay assistant. Given a story/scene excerpt, generate short, natural, "
+            "context-specific user follow-up prompts/reactions (1-3 sentences each) that nudge the "
+            "narrator to continue the scene. Return ONLY a JSON list of strings.",
+            f"Excerpt:\n{text[:2500]}\n\nGenerate {count} varied follow-up probes as a JSON array of strings:",
+            temperature=0.3,
+            max_tokens=512,
+            json_mode=True,
+        )
+        data = extract_json(raw)
+        if isinstance(data, dict):
+            data = data.get("probes") or data.get("prompts") or []
+        if isinstance(data, list):
+            probes = [str(p).strip() for p in data if str(p).strip()]
+            if probes:
+                return probes
+    except Exception:
+        pass
+    return None
+
+
+def chunk_prose_to_progressive_turns(text, chapter_name="", user_probes=None, first_user_prompt=None):
     """Deterministically transform raw prose into a high-density, multi-turn dialogue."""
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     if not paragraphs:
         paragraphs = [text.strip()]
 
     turns = []
-    title_ref = f" regarding {chapter_name}" if chapter_name else ""
-    turns.append({
-        "role": "user",
-        "text": f"*Looks over{title_ref}.* Go on—tell me what happened."
-    })
+    if first_user_prompt:
+        turns.append({"role": "user", "text": first_user_prompt})
+    else:
+        title_ref = f" regarding {chapter_name}" if chapter_name else ""
+        turns.append({
+            "role": "user",
+            "text": f"*Looks over{title_ref}.* Go on—tell me what happened."
+        })
 
     default_probes = [
         "What happened next?",
@@ -562,16 +589,31 @@ def main():
         if not any(t["role"] == "char" for t in turns) or has_repetition_loop or is_truncated:
             if convert.get("fallback_on_fail", True):
                 ch_name = scene.get("chapter") or ""
-                turns = chunk_prose_to_progressive_turns(source_text, chapter_name=ch_name)
+                custom_probes = synthesize_custom_probes(llm, source_text, count=6)
+                turns = chunk_prose_to_progressive_turns(
+                    source_text,
+                    chapter_name=ch_name,
+                    user_probes=custom_probes,
+                    first_user_prompt=scene.get("input_prompt"),
+                )
                 used_fallback = True
             elif not any(t["role"] == "char" for t in turns):
                 print(f"scene {scene['id']}: skipped (no char turns, fallback_on_fail is false)")
                 skipped += 1
                 continue
+        elif scene.get("input_prompt") and turns and turns[0].get("role") == "user":
+            turns[0]["text"] = scene["input_prompt"]
 
-        append_jsonl(out_path, {"id": next_id, "source_id": scene["id"],
-                                "char": scene["_char"], "user": scene["_user"],
-                                "turns": turns})
+        record = {
+            "id": next_id,
+            "source_id": scene["id"],
+            "char": scene["_char"],
+            "user": scene["_user"],
+            "turns": turns,
+        }
+        if scene.get("system_prompt"):
+            record["system_prompt"] = scene["system_prompt"]
+        append_jsonl(out_path, record)
         mode_tag = " [fallback]" if used_fallback else ""
         print(f"scene {scene['id']} -> rp {next_id}: {len(turns)} turns "
               f"({scene['_char']} / {scene['_user']}){mode_tag}")

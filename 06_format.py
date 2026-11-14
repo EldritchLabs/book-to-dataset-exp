@@ -80,9 +80,10 @@ def main():
             if clean_txt:
                 repaired_turns.append({"role": t["role"], "text": clean_txt})
 
+        sys_card = row.get("system_prompt") or render(card_template, char=char_name)
         session = to_sharegpt(
             repaired_turns,
-            render(card_template, char=char_name),
+            sys_card,
             opener=opener,
         )
         if session:

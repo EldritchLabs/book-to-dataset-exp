@@ -24,7 +24,7 @@ import re
 import sys
 
 from pipeline.config import load_config, parse_args, resolve_input_path, work_path
-from pipeline.files import read_text, write_jsonl
+from pipeline.files import append_jsonl, read_jsonl, read_text, write_jsonl
 from pipeline.lang import chapter_regex, load_pack, render
 from pipeline.llm import LLM, extract_json
 
@@ -295,6 +295,59 @@ def main():
     source_file = resolve_input_path(cfg)
     print(f"Segmenting source: {source_file}")
     text = normalize(read_text(source_file, cfg["input"]["encodings"]))
+
+    # v5.1: {{[INPUT]}} / {{[OUTPUT]}} pair mode
+    io_matches = re.findall(
+        r"\{\{\[INPUT\]\}\}(.*?)\{\{\[OUTPUT\]\}\}(.*?)(?=\{\{\[INPUT\]\}\}|\Z)",
+        text,
+        re.S,
+    )
+    if io_matches:
+        output = work_path(cfg, "scenes.jsonl")
+        existing = read_jsonl(output)
+        done = {item["id"] for item in existing}
+        if done:
+            print(f"[resume] {len(done)}/{len(io_matches)} pairs already segmented, continuing")
+        else:
+            print(f"Detected {len(io_matches)} {{{{[INPUT]}}}}/{{{{[OUTPUT]}}}} pairs — synthesizing custom system prompts...")
+
+        debug_dir = work_path(cfg, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        n_new = 0
+        for scene_id, (raw_in, raw_out) in enumerate(io_matches):
+            if scene_id in done:
+                continue
+            inp = raw_in.strip()
+            out = raw_out.strip()
+            if not out:
+                continue
+            sys_prompt = ""
+            try:
+                sys_prompt = llm.chat(
+                    "You are an expert prompt engineer. Given a user story-seed/input and the "
+                    "assistant's opening/output, write a concise, atmospheric system prompt (2-4 sentences) "
+                    "that instructs a roleplay/storytelling model on the tone, setting, and persona.",
+                    f"INPUT:\n{inp[:1500]}\n\nOUTPUT:\n{out[:2000]}\n\nWrite ONLY the system prompt:",
+                    temperature=0.3,
+                    max_tokens=512,
+                ).strip()
+            except Exception as exc:
+                print(f"  [warn] pair {scene_id}: system prompt synthesis failed ({exc})", file=sys.stderr)
+            item = {
+                "id": scene_id,
+                "chapter": f"Pair {scene_id}",
+                "text": out,
+                "chars": len(out),
+                "input_prompt": inp,
+                "system_prompt": sys_prompt,
+            }
+            append_jsonl(output, item)
+            n_new += 1
+            print(f"  pair {scene_id}/{len(io_matches) - 1}: input={len(inp)}c, output={len(out)}c, sys_prompt={len(sys_prompt)}c", flush=True)
+
+        print(f"\nDone: {len(done) + n_new} total scenes ({n_new} new) -> {output}")
+        return
+
     md_heading_re = build_header_regex(cfg)
     blocks = structural_blocks(text, chapter_regex(pack, full_line=True), md_heading_re)
     print(f"Structural pass: {len(blocks)} blocks")

@@ -73,6 +73,11 @@ def main():
         if len(b) > 400
         and sum(1 for ln in b.split("\n") if DIALOGUE_START.match(ln.strip())) / max(1, len(b.split("\n"))) > 0.8
     ]
+    io_pairs = re.findall(
+        r"\{\{\[INPUT\]\}\}(.*?)\{\{\[OUTPUT\]\}\}(.*?)(?=\{\{\[INPUT\]\}\}|\Z)",
+        text,
+        re.S,
+    )
     chapters = [
         ln.strip() for ln in lines 
         if (chapter_re.match(ln) or md_heading_re.match(ln.strip())) and len(ln.strip()) < 120
@@ -88,6 +93,8 @@ def main():
     print(f"Blocks opening with direct speech: {len(dialogue_blocks)} "
           f"({100 * len(dialogue_blocks) // max(1, len(blocks))}%)")
     print(f"Large dialogue-only blocks: {len(pure_dialogue)}")
+    if io_pairs:
+        print(f"Input/Output pairs found: {len(io_pairs)} ({{[INPUT]}} / {{[OUTPUT]}} mode)")
     print(f"Chapter headings found: {len(chapters)}"
           + (f", for example: {chapters[:3]}" if chapters else ""))
     print(f"Explicit scene breaks found: {len(breaks)}")
